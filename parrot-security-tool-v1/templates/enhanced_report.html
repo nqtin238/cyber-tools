@@ -1,0 +1,439 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Enhanced Security Test Report - {{ timestamp }}</title>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <style>
+        body { 
+            font-family: Arial, sans-serif; 
+            margin: 0;
+            padding: 0;
+            color: #333;
+            background-color: #f5f5f5;
+        }
+        .container {
+            width: 95%;
+            margin: 0 auto;
+            padding: 20px;
+        }
+        header {
+            background-color: #2c3e50;
+            color: white;
+            padding: 20px;
+            text-align: center;
+        }
+        h1 { margin: 0; }
+        h2 { 
+            color: #2c3e50;
+            border-bottom: 2px solid #2c3e50;
+            padding-bottom: 10px;
+            margin-top: 30px;
+        }
+        .dashboard {
+            display: flex;
+            flex-wrap: wrap;
+            margin: 20px 0;
+            gap: 20px;
+        }
+        .dashboard-item {
+            flex: 1;
+            min-width: 250px;
+            background-color: white;
+            border-radius: 5px;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+            padding: 15px;
+        }
+        .severity-high { color: #e74c3c; font-weight: bold; }
+        .severity-medium { color: #f39c12; }
+        .severity-low { color: #27ae60; }
+        .severity-circle {
+            display: inline-block;
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            margin-right: 5px;
+        }
+        .high { background-color: #e74c3c; }
+        .medium { background-color: #f39c12; }
+        .low { background-color: #27ae60; }
+        table { 
+            border-collapse: collapse; 
+            width: 100%;
+            margin-bottom: 20px;
+            background-color: white;
+        }
+        th, td { 
+            border: 1px solid #ddd; 
+            padding: 12px 8px;
+            text-align: left;
+        }
+        th { 
+            background-color: #2c3e50; 
+            color: white;
+            position: sticky;
+            top: 0;
+        }
+        tr:nth-child(even) { background-color: #f2f2f2; }
+        tr:hover { background-color: #e9f7fe; }
+        .search-container {
+            margin: 20px 0;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        input[type="text"] {
+            width: 100%;
+            padding: 10px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            font-size: 16px;
+        }
+        .filters {
+            display: flex;
+            gap: 15px;
+            margin: 10px 0 20px 0;
+        }
+        .filter-btn {
+            border: none;
+            background-color: #2c3e50;
+            color: white;
+            padding: 8px 15px;
+            border-radius: 4px;
+            cursor: pointer;
+        }
+        .filter-btn:hover {
+            background-color: #1a252f;
+        }
+        .filter-btn.active {
+            background-color: #16a085;
+        }
+        .tab {
+            overflow: hidden;
+            border: 1px solid #ccc;
+            background-color: #f1f1f1;
+            border-radius: 5px 5px 0 0;
+        }
+        .tab button {
+            background-color: inherit;
+            float: left;
+            border: none;
+            outline: none;
+            cursor: pointer;
+            padding: 14px 16px;
+            transition: 0.3s;
+            font-size: 17px;
+        }
+        .tab button:hover {
+            background-color: #ddd;
+        }
+        .tab button.active {
+            background-color: #2c3e50;
+            color: white;
+        }
+        .tabcontent {
+            display: none;
+            padding: 20px;
+            border: 1px solid #ccc;
+            border-top: none;
+            border-radius: 0 0 5px 5px;
+            background-color: white;
+        }
+        .expand-btn {
+            background: none;
+            border: none;
+            color: #3498db;
+            cursor: pointer;
+            font-weight: bold;
+        }
+        .detail-row {
+            display: none;
+        }
+        footer {
+            text-align: center;
+            margin-top: 30px;
+            padding: 20px;
+            background-color: #2c3e50;
+            color: white;
+        }
+    </style>
+    <script>
+        function filterTable() {
+            const input = document.getElementById("ipFilter");
+            const filter = input.value.toLowerCase();
+            const tables = document.getElementsByTagName("table");
+            
+            for (let t = 0; t < tables.length; t++) {
+                const table = tables[t];
+                const rows = table.getElementsByTagName("tr");
+                
+                for (let i = 1; i < rows.length; i++) {
+                    const row = rows[i];
+                    if (row.classList.contains('detail-row')) continue;
+                    
+                    let showRow = false;
+                    const cells = row.getElementsByTagName("td");
+                    
+                    for (let j = 0; j < cells.length; j++) {
+                        const cell = cells[j];
+                        if (cell.textContent.toLowerCase().indexOf(filter) > -1) {
+                            showRow = true;
+                            break;
+                        }
+                    }
+                    
+                    row.style.display = showRow ? "" : "none";
+                    
+                    // Handle associated detail rows
+                    const detailRow = row.nextElementSibling;
+                    if (detailRow && detailRow.classList.contains('detail-row')) {
+                        detailRow.style.display = (showRow && detailRow.dataset.expanded === 'true') ? "" : "none";
+                    }
+                }
+            }
+        }
+        
+        function filterBySeverity(severity) {
+            const buttons = document.querySelectorAll('.filter-btn');
+            buttons.forEach(btn => btn.classList.remove('active'));
+            
+            if (severity) {
+                document.getElementById('btn-' + severity).classList.add('active');
+            } else {
+                document.getElementById('btn-all').classList.add('active');
+            }
+            
+            const rows = document.querySelectorAll('#vulnerabilities-table tr');
+            rows.forEach(row => {
+                if (row.classList.contains('detail-row')) return;
+                
+                if (!severity || severity === 'all') {
+                    row.style.display = '';
+                } else {
+                    const severityCell = row.querySelector('td.severity-cell');
+                    if (severityCell) {
+                        const rowSeverity = severityCell.dataset.severity;
+                        row.style.display = (rowSeverity === severity) ? '' : 'none';
+                        
+                        // Handle associated detail row
+                        const detailRow = row.nextElementSibling;
+                        if (detailRow && detailRow.classList.contains('detail-row')) {
+                            detailRow.style.display = (rowSeverity === severity && detailRow.dataset.expanded === 'true') ? '' : 'none';
+                        }
+                    }
+                }
+            });
+        }
+        
+        function openTab(evt, tabName) {
+            const tabcontent = document.getElementsByClassName("tabcontent");
+            for (let i = 0; i < tabcontent.length; i++) {
+                tabcontent[i].style.display = "none";
+            }
+            
+            const tablinks = document.getElementsByClassName("tablinks");
+            for (let i = 0; i < tablinks.length; i++) {
+                tablinks[i].className = tablinks[i].className.replace(" active", "");
+            }
+            
+            document.getElementById(tabName).style.display = "block";
+            evt.currentTarget.className += " active";
+        }
+        
+        function toggleDetails(id) {
+            const detailRow = document.getElementById('detail-' + id);
+            const expanded = detailRow.style.display === 'table-row';
+            detailRow.style.display = expanded ? 'none' : 'table-row';
+            detailRow.dataset.expanded = expanded ? 'false' : 'true';
+            
+            const button = document.getElementById('btn-expand-' + id);
+            button.textContent = expanded ? 'Show Details' : 'Hide Details';
+        }
+        
+        // Initialize page when loaded
+        document.addEventListener('DOMContentLoaded', function() {
+            // Open the first tab by default
+            document.getElementsByClassName('tablinks')[0].click();
+        });
+    </script>
+</head>
+<body>
+    <header>
+        <h1>Enhanced Security Test Report</h1>
+        <p>Generated: {{ timestamp }}</p>
+    </header>
+    
+    <div class="container">
+        <div class="search-container">
+            <input type="text" id="ipFilter" onkeyup="filterTable()" placeholder="Search for IPs, services, vulnerabilities...">
+        </div>
+        
+        <div class="tab">
+            <button class="tablinks" onclick="openTab(event, 'Dashboard')">Dashboard</button>
+            <button class="tablinks" onclick="openTab(event, 'Targets')">Discovered Targets</button>
+            <button class="tablinks" onclick="openTab(event, 'Vulnerabilities')">Vulnerabilities</button>
+            <button class="tablinks" onclick="openTab(event, 'TestResults')">Test Results</button>
+        </div>
+        
+        <!-- Dashboard Tab -->
+        <div id="Dashboard" class="tabcontent">
+            <h2>Security Dashboard</h2>
+            <div class="dashboard">
+                <div class="dashboard-item">
+                    <h3>Vulnerability Severity</h3>
+                    <div class="severity-stats">
+                        <p><span class="severity-circle high"></span> High: {{ high_count }}</p>
+                        <p><span class="severity-circle medium"></span> Medium: {{ medium_count }}</p>
+                        <p><span class="severity-circle low"></span> Low: {{ low_count }}</p>
+                    </div>
+                </div>
+                
+                <div class="dashboard-item">
+                    <h3>System Summary</h3>
+                    <p>Total Targets: {{ targets|length }}</p>
+                    <p>Total Vulnerabilities: {{ vulnerabilities|length }}</p>
+                    <p>Total Tests: {{ test_results|length }}</p>
+                </div>
+                
+                <div class="dashboard-item">
+                    <h3>Most Vulnerable Systems</h3>
+                    <ul>
+                        {% for ip, count in top_vulnerable_systems %}
+                            <li>{{ ip }}: {{ count }} vulnerabilities</li>
+                        {% endfor %}
+                    </ul>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Targets Tab -->
+        <div id="Targets" class="tabcontent">
+            <h2>Discovered Targets</h2>
+            {% if targets %}
+                <table id="targets-table">
+                    <tr>
+                        <th>IP Address</th>
+                        <th>MAC Address</th>
+                        <th>Platform</th>
+                        <th>Version</th>
+                        <th>Open Ports</th>
+                        <th>Scan Timestamp</th>
+                    </tr>
+                    {% for target in targets %}
+                        <tr>
+                            <td>{{ target.ip }}</td>
+                            <td>{{ target.mac or 'N/A' }}</td>
+                            <td>{{ target.os or 'Unknown' }}</td>
+                            <td>{{ target.version or 'N/A' }}</td>
+                            <td>
+                                {% if target.ports %}
+                                    {{ target.ports|join(', ') }}
+                                {% else %}
+                                    None detected
+                                {% endif %}
+                            </td>
+                            <td>{{ target.scan_timestamp }}</td>
+                        </tr>
+                    {% endfor %}
+                </table>
+            {% else %}
+                <p>No targets discovered.</p>
+            {% endif %}
+        </div>
+        
+        <!-- Vulnerabilities Tab -->
+        <div id="Vulnerabilities" class="tabcontent">
+            <h2>Vulnerabilities</h2>
+            <div class="filters">
+                <button id="btn-all" class="filter-btn active" onclick="filterBySeverity('all')">All</button>
+                <button id="btn-high" class="filter-btn" onclick="filterBySeverity('high')">High</button>
+                <button id="btn-medium" class="filter-btn" onclick="filterBySeverity('medium')">Medium</button>
+                <button id="btn-low" class="filter-btn" onclick="filterBySeverity('low')">Low</button>
+            </div>
+            
+            {% if vulnerabilities %}
+                <table id="vulnerabilities-table">
+                    <tr>
+                        <th>IP Address</th>
+                        <th>Port</th>
+                        <th>Script</th>
+                        <th>CVE</th>
+                        <th>Score</th>
+                        <th>Actions</th>
+                    </tr>
+                    {% for vuln in vulnerabilities %}
+                        {% set severity = 'high' if vuln.score >= 7.0 else ('medium' if vuln.score >= 4.0 else 'low') %}
+                        <tr>
+                            <td>{{ vuln.ip }}</td>
+                            <td>{{ vuln.port }}</td>
+                            <td>{{ vuln.script }}</td>
+                            <td>{{ vuln.cve or 'N/A' }}</td>
+                            <td class="severity-cell severity-{{ severity }}" data-severity="{{ severity }}">{{ vuln.score }}</td>
+                            <td>
+                                <button id="btn-expand-{{ loop.index }}" class="expand-btn" onclick="toggleDetails('{{ loop.index }}')">Show Details</button>
+                            </td>
+                        </tr>
+                        <tr id="detail-{{ loop.index }}" class="detail-row" data-expanded="false">
+                            <td colspan="6">
+                                <strong>Description:</strong>
+                                <p>{{ vuln.description or 'No description available' }}</p>
+                                <strong>Output:</strong>
+                                <pre>{{ vuln.output }}</pre>
+                                <strong>Discovery Time:</strong> {{ vuln.timestamp }}
+                            </td>
+                        </tr>
+                    {% endfor %}
+                </table>
+            {% else %}
+                <p>No vulnerabilities found.</p>
+            {% endif %}
+        </div>
+        
+        <!-- Test Results Tab -->
+        <div id="TestResults" class="tabcontent">
+            <h2>Test Results</h2>
+            {% if test_results %}
+                <table id="results-table">
+                    <tr>
+                        <th>IP Address</th>
+                        <th>Test Name</th>
+                        <th>Status</th>
+                        <th>Timestamp</th>
+                        <th>Actions</th>
+                    </tr>
+                    {% for result in test_results %}
+                        <tr>
+                            <td>{{ result.ip }}</td>
+                            <td>{{ result.test_name }}</td>
+                            <td>
+                                {% if "[SUCCESS]" in result.result %}
+                                    <span style="color: green;">Success</span>
+                                {% elif "[ERROR]" in result.result %}
+                                    <span style="color: red;">Error</span>
+                                {% else %}
+                                    <span style="color: blue;">Info</span>
+                                {% endif %}
+                            </td>
+                            <td>{{ result.timestamp }}</td>
+                            <td>
+                                <button id="btn-expand-result-{{ loop.index }}" class="expand-btn" onclick="toggleDetails('result-{{ loop.index }}')">Show Output</button>
+                            </td>
+                        </tr>
+                        <tr id="detail-result-{{ loop.index }}" class="detail-row" data-expanded="false">
+                            <td colspan="5">
+                                <pre>{{ result.result }}</pre>
+                            </td>
+                        </tr>
+                    {% endfor %}
+                </table>
+            {% else %}
+                <p>No test results available.</p>
+            {% endif %}
+        </div>
+    </div>
+    
+    <footer>
+        <p>Generated by Interactive System Tester</p>
+    </footer>
+</body>
+</html>

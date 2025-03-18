@@ -1,0 +1,5 @@
+pyyaml
+paramiko
+proxmoxer
+requests
+tenacity

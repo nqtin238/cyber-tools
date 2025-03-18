@@ -1,0 +1,4 @@
+prompt_toolkit
+tqdm
+jinja2
+requests
