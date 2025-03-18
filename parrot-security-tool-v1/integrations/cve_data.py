@@ -162,6 +162,27 @@ class CVEDataProvider:
             logging.error(f"Error fetching CVE data for {cve_id}: {str(e)}")
             return None
     
+    def fetch_cve_data(self, keyword):
+        """
+        Fetch real-time CVE data from the NVD API based on a keyword.
+        """
+        try:
+            url = f"https://services.nvd.nist.gov/rest/json/cves/1.0"
+            params = {"keyword": keyword}
+            headers = {"apiKey": self.api_key} if self.api_key else {}
+
+            logging.info(f"Fetching CVE data for keyword: {keyword}")
+            response = requests.get(url, headers=headers, params=params, timeout=10)
+
+            if response.status_code == 200:
+                return response.json()
+            else:
+                logging.error(f"Failed to fetch CVE data: {response.status_code}")
+                return None
+        except Exception as e:
+            logging.error(f"Error fetching CVE data: {str(e)}")
+            return None
+
     def cleanup(self):
         """Save cache and perform cleanup"""
         self.save_cache()

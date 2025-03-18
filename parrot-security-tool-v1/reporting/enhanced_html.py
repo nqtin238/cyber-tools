@@ -1,6 +1,7 @@
 """Enhanced HTML reporting module"""
 import os
 import logging
+import json
 from datetime import datetime
 from jinja2 import Environment, FileSystemLoader
 
@@ -127,3 +128,22 @@ class EnhancedHTMLReport:
         print(f"\033[92m[+] Enhanced HTML report generated: {report_file}\033[0m")
         
         return report_file
+
+    def generate_json(self, output_file):
+        """
+        Export the report data as a JSON file.
+        """
+        report_data = {
+            "targets": targets,
+            "vulnerabilities": vulnerabilities,
+            "test_results": test_results,
+            "summary": {
+                "high_count": high_count,
+                "medium_count": medium_count,
+                "low_count": low_count,
+                "top_vulnerable_systems": top_vulnerable_systems,
+            },
+        }
+        with open(output_file, "w") as f:
+            json.dump(report_data, f, indent=4)
+        logging.info(f"Report exported as JSON: {output_file}")

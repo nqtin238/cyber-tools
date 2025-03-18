@@ -19,6 +19,32 @@ if [ "$EUID" -ne 0 ]; then
     exit 1
 fi
 
+# Check Python version compatibility
+PYTHON_VERSION=$(python3 --version 2>&1 | awk '{print $2}')
+REQUIRED_VERSION="3.8"
+
+if [[ $(echo -e "$PYTHON_VERSION\n$REQUIRED_VERSION" | sort -V | head -n1) != "$REQUIRED_VERSION" ]]; then
+    echo "Error: Python 3.8 or higher is required. Current version: $PYTHON_VERSION"
+    exit 1
+fi
+
+# Add --dry-run option
+DRY_RUN=false
+while [[ "$#" -gt 0 ]]; do
+    case $1 in
+        --dry-run) DRY_RUN=true ;;
+        *) echo "Unknown parameter passed: $1"; exit 1 ;;
+    esac
+    shift
+done
+
+if $DRY_RUN; then
+    echo "Dry run: Simulating setup process..."
+    echo "Python version check: PASSED"
+    echo "Dependencies to install: $(cat requirements.txt)"
+    exit 0
+fi
+
 # Print banner
 echo -e "${BLUE}"
 echo "====================================================="

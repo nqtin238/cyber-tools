@@ -10,6 +10,12 @@ class BaseScanner(ABC):
     def __init__(self, options=None):
         self.options = options or {}
         self.results = {}
+        self.metadata = {
+            "name": "BaseScanner",
+            "description": "Base class for all scanner plugins",
+            "supported_protocols": [],
+            "expected_runtime": "N/A",
+        }
         
     @abstractmethod
     def scan(self, target):

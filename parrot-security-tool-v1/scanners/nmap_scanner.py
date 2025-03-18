@@ -9,6 +9,15 @@ import tempfile
 class NmapScanner(BaseScanner):
     """Nmap vulnerability scanner plugin"""
     
+    def __init__(self, options=None):
+        super().__init__(options)
+        self.metadata = {
+            "name": "NmapScanner",
+            "description": "Performs network scans using Nmap",
+            "supported_protocols": ["TCP", "UDP"],
+            "expected_runtime": "Medium",
+        }
+    
     def scan(self, target):
         """Run nmap vulnerability scan"""
         # Extract options with defaults
