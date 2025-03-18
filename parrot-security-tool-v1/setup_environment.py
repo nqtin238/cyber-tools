@@ -1,152 +1,153 @@
 #!/usr/bin/env python3
-"""
-Setup environment for the Security Testing Tools
-Creates necessary directories and initializes the required file structure.
-"""
-
+"""Environment setup script for the security tool"""
 import os
 import sys
+import subprocess
 import logging
-import argparse
-import shutil
+import platform
 
-def setup_environment(force=False):
-    """Setup the required directory structure and files"""
-    base_dir = os.path.dirname(os.path.abspath(__file__))
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger(__name__)
+
+def check_python_version():
+    """Check if Python version meets requirements"""
+    required_version = (3, 8)
+    current_version = sys.version_info
     
-    # Create directories
-    directories = [
-        'logs',
-        'reports',
-        'templates',
-        'scanners',
-        'utils',
-        'reporting',
-        'integrations'
+    if current_version < required_version:
+        logger.error(f"Python {required_version[0]}.{required_version[1]} or higher is required")
+        return False
+        
+    logger.info(f"Python version check passed: {platform.python_version()}")
+    return True
+
+def install_dependencies():
+    """Install required Python packages"""
+    requirements = [
+        "psutil>=5.9.0",  # For resource monitoring
+        "aiohttp>=3.8.1",  # For async HTTP requests
+        "aiodns>=3.0.0",   # For async DNS resolution
+        "cchardet>=2.1.7", # For faster character encoding detection
+        "uvloop>=0.16.0;platform_system!='Windows'", # Faster event loop implementation for non-Windows
+        "prompt_toolkit>=3.0.29",
+        "tqdm>=4.64.0",
+        "jinja2>=3.1.2",
+        "python-dateutil>=2.8.2",
+        "requests>=2.28.0",
+        "ipaddress>=1.0.23"
     ]
     
-    for directory in directories:
-        dir_path = os.path.join(base_dir, directory)
-        if not os.path.exists(dir_path):
-            os.makedirs(dir_path)
-            print(f"Created directory: {dir_path}")
+    logger.info("Installing required Python packages...")
+    
+    for req in requirements:
+        try:
+            logger.info(f"Installing {req}")
+            # Use pip to install the package
+            subprocess.run(
+                [sys.executable, "-m", "pip", "install", req],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE
+            )
+        except subprocess.CalledProcessError as e:
+            logger.error(f"Failed to install {req}: {e.stderr.decode()}")
+        except Exception as e:
+            logger.error(f"Error installing {req}: {str(e)}")
+    
+    logger.info("Dependency installation complete")
+
+def configure_asyncio():
+    """Configure asyncio for optimal performance"""
+    try:
+        import asyncio
+        
+        # Use uvloop if available (not on Windows)
+        if platform.system() != "Windows":
+            try:
+                import uvloop
+                asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+                logger.info("AsyncIO configured with uvloop for improved performance")
+            except ImportError:
+                logger.warning("uvloop not available, using standard event loop")
         else:
-            print(f"Directory already exists: {dir_path}")
-    
-    # Create __init__.py files for Python packages
-    for directory in ['scanners', 'utils', 'reporting', 'integrations']:
-        init_file = os.path.join(base_dir, directory, '__init__.py')
-        if not os.path.exists(init_file) or force:
-            with open(init_file, 'w') as f:
-                if directory == 'scanners':
-                    f.write("""\"\"\"Scanner plugin system\"\"\"
-import importlib
-import os
-import logging
-from abc import ABC, abstractmethod
+            # On Windows, configure the selector event loop for better performance
+            asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+            logger.info("AsyncIO configured with WindowsSelectorEventLoopPolicy")
+            
+    except Exception as e:
+        logger.error(f"Failed to configure AsyncIO: {str(e)}")
 
-class BaseScanner(ABC):
-    \"\"\"Base class for all scanner plugins\"\"\"
+# Add a new function to setup logging
+def configure_logging(args=None):
+    """Configure logging system based on command line arguments"""
+    from utils.logging_config import initialize_logging
     
-    def __init__(self, options=None):
-        self.options = options or {}
-        self.results = {}
-        
-    @abstractmethod
-    def scan(self, target):
-        \"\"\"Run the scan implementation\"\"\"
-        pass
-        
-    def get_results(self):
-        \"\"\"Return scan results\"\"\"
-        return self.results
-""")
-                else:
-                    f.write(f"""\"\"\"
-{directory.capitalize()} package for security testing tools
-\"\"\"
+    # Default values
+    log_level = "INFO"
+    json_format = False
+    sentry_dsn = None
+    
+    # Override with command line arguments if provided
+    if args:
+        if hasattr(args, 'log_level') and args.log_level:
+            log_level = args.log_level
+        if hasattr(args, 'json_logs') and args.json_logs:
+            json_format = True
+        if hasattr(args, 'sentry_dsn') and args.sentry_dsn:
+            sentry_dsn = args.sentry_dsn
+    
+    # Initialize the logging system
+    initialize_logging(
+        level=log_level,
+        app_name="parrot-security-tool",
+        sentry_dsn=sentry_dsn,
+        json_format=json_format,
+        log_to_console=True,
+        log_to_file=True
+    )
+    
+    logger.info(f"Logging system initialized with level {log_level} and JSON format: {json_format}")
+    if sentry_dsn:
+        logger.info("Sentry error tracking enabled")
 
-# This file marks this directory as a Python package
-""")
-            print(f"Created/updated package file: {init_file}")
+def setup_environment(install_deps=True):
+    """Set up the environment for the security tool"""
+    logger.info("Setting up environment...")
     
-    # Copy scanner plugins if not existing or force is True
-    source_dir = os.path.join(base_dir, 'scanners')
-    scanner_files = [
-        'nmap_scanner.py',
-        'masscan_scanner.py',
-        'netcat_scanner.py',
-        'nikto_scanner.py',
-        'sqlmap_scanner.py',
-        'metasploit_scanner.py',
-        'lynis_scanner.py',
-        'chkrootkit_scanner.py',
-        'john_scanner.py',
-        'anonsurf_scanner.py',
-        'aircrack_scanner.py'
-    ]
+    # Check Python version
+    if not check_python_version():
+        return False
     
-    # Verify scanner files exist
-    missing_files = []
-    for scanner_file in scanner_files:
-        file_path = os.path.join(source_dir, scanner_file)
-        if not os.path.exists(file_path):
-            missing_files.append(scanner_file)
+    # Install dependencies if requested
+    if install_deps:
+        install_dependencies()
     
-    if missing_files:
-        print("\nWARNING: The following scanner files are missing:")
-        for file in missing_files:
-            print(f"  - {file}")
-        print("\nPlease ensure all scanner plugins are properly installed.")
-    else:
-        print("\nAll required scanner plugins are present.")
+    # Configure AsyncIO
+    configure_asyncio()
     
-    # Initialize utils directory
-    utils_dir = os.path.join(base_dir, 'utils')
-    plugin_loader_file = os.path.join(utils_dir, 'plugin_loader.py')
-    if not os.path.exists(plugin_loader_file) or force:
-        # You would write the plugin_loader.py content here
-        # We've already created it, so we'll just check for it
-        if not os.path.exists(plugin_loader_file):
-            print(f"WARNING: Plugin loader file is missing: {plugin_loader_file}")
+    # Create necessary directories
+    os.makedirs("logs", exist_ok=True)
+    os.makedirs("reports", exist_ok=True)
+    os.makedirs("cache", exist_ok=True)
+    os.makedirs("templates", exist_ok=True)
     
-    print("\nEnvironment setup complete!")
-
-def check_dependencies():
-    """Check if required external tools are installed"""
-    tools = [
-        'nmap',
-        'nikto',
-        'sqlmap',
-        'msfconsole',
-        'aircrack-ng',
-        'john',
-        'lynis',
-        'chkrootkit',
-        'anonsurf'
-    ]
-    
-    missing_tools = []
-    for tool in tools:
-        if shutil.which(tool) is None:
-            missing_tools.append(tool)
-    
-    if missing_tools:
-        print("\nWARNING: The following tools are not installed or not in PATH:")
-        for tool in missing_tools:
-            print(f"  - {tool}")
-        print("\nSome functionality may be limited. Please install these tools for full functionality.")
-    else:
-        print("\nAll required external tools are installed!")
+    logger.info("Environment setup complete")
+    return True
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Setup environment for Security Testing Tools")
-    parser.add_argument("-f", "--force", action="store_true", help="Force overwrite of existing files")
-    parser.add_argument("-d", "--dependencies", action="store_true", help="Check for external dependencies")
+    import argparse
     
+    parser = argparse.ArgumentParser(description="Set up the environment for the security tool")
+    parser.add_argument("--no-deps", action="store_true", help="Skip installing dependencies")
     args = parser.parse_args()
     
-    setup_environment(args.force)
-    
-    if args.dependencies:
-        check_dependencies()
+    if setup_environment(not args.no_deps):
+        logger.info("Environment setup successful")
+        sys.exit(0)
+    else:
+        logger.error("Environment setup failed")
+        sys.exit(1)

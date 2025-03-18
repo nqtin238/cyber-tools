@@ -83,6 +83,10 @@ python-nmap>=0.7.1
 
 # Plugins support
 importlib-metadata>=4.0.0
+
+# Async support
+aiohttp>=3.8.0
+uvloop>=0.16.0;platform_system!="Windows"
 EOF
     echo -e "${GREEN}Created requirements.txt${NC}"
 }

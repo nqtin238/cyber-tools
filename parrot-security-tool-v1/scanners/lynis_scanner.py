@@ -1,94 +1,104 @@
 """Lynis security auditing scanner implementation"""
-from scanners import BaseScanner
+from scanners.base_scanner import BaseScanner
 import subprocess
 import logging
 import tempfile
 import os
 import re
+import asyncio
+import time
 
 class LynisScanner(BaseScanner):
     """Lynis security auditing scanner plugin"""
+    # Define which profiles this scanner belongs to
+    profile_tags = ["all", "auditing", "compliance"]
     
+    def __init__(self, options=None):
+        super().__init__(options)
+        
     def scan(self, target):
-        """Run Lynis security audit scan"""
-        # Note: Lynis typically runs on the local system
-        # For remote systems, you'd need to run it via SSH or other methods
-        
-        # Extract options with defaults
-        verbose = self.options.get('verbose', False)
-        
-        # Create temp file for output
-        fd, output_file = tempfile.mkstemp(suffix='.txt', prefix='lynis_')
-        os.close(fd)
-        
-        try:
-            # Check if target is localhost or local IP
-            is_local = target in ['127.0.0.1', 'localhost', '::1']
-            
-            if not is_local:
-                logging.warning(f"Lynis typically runs on localhost. Target {target} may not be accessible.")
-                if verbose:
-                    print(f"\033[93m[!] Warning: Lynis typically runs on localhost. Target {target} may not be accessible.\033[0m")
-            
-            # Build the command
-            cmd = f"lynis audit system --report-file {output_file}"
-                
-            # Run the command
-            logging.info(f"Running Lynis security audit")
-            if verbose:
-                print(f"\033[94m[*] Running Lynis security audit...\033[0m")
-                
-            result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-            
-            # Initialize results
-            self.results = {
-                'vulnerabilities': [],
-                'command': cmd,
-                'raw_output': result.stdout + result.stderr,
-                'warnings': [],
-                'suggestions': []
+        """Run Lynis scan on target"""
+        if target not in ["127.0.0.1", "localhost", "::1"]:
+            return {
+                "error": "Lynis scanner only works on localhost",
+                "raw_output": ""
             }
             
-            # Parse the output
-            warning_pattern = r"(\[\s*WARNING\s*\])\s*(.*)"
-            suggestion_pattern = r"(\[\s*SUGGESTION\s*\])\s*(.*)"
-            
-            for line in result.stdout.splitlines():
-                # Extract warnings
-                warning_match = re.search(warning_pattern, line)
-                if warning_match:
-                    self.results['warnings'].append(warning_match.group(2).strip())
-                    
-                    # Add severe warnings as vulnerabilities
-                    if "Critical" in line or "High" in line:
-                        self.results['vulnerabilities'].append({
-                            'script': 'lynis',
-                            'port': 0,  # Not port specific
-                            'output': warning_match.group(2).strip(),
-                            'cve': None  # Lynis doesn't typically report CVEs directly
-                        })
-                
-                # Extract suggestions
-                suggestion_match = re.search(suggestion_pattern, line)
-                if suggestion_match:
-                    self.results['suggestions'].append(suggestion_match.group(2).strip())
-            
-            # Read report file for more details if available
-            if os.path.exists(output_file) and os.path.getsize(output_file) > 0:
-                with open(output_file, 'r') as f:
-                    self.results['report'] = f.read()
-            
-            if verbose:
-                print(f"\033[92m[+] Lynis found {len(self.results['warnings'])} warnings and {len(self.results['suggestions'])} suggestions\033[0m")
-                
-            return self.results
+        # Check if lynis is installed
+        try:
+            result = subprocess.run(["which", "lynis"], capture_output=True, text=True)
+            if result.returncode != 0:
+                return {
+                    "error": "Lynis not found. Please install Lynis.",
+                    "raw_output": ""
+                }
         except Exception as e:
-            logging.error(f"Error in Lynis scan: {str(e)}")
-            return {'error': str(e)}
-        finally:
-            # Clean up temp file
-            if os.path.exists(output_file):
-                try:
-                    os.remove(output_file)
-                except Exception as e:
-                    logging.warning(f"Could not delete Lynis output file {output_file}: {str(e)}")
+            return {
+                "error": f"Error checking for Lynis: {str(e)}",
+                "raw_output": ""
+            }
+            
+        # Create temporary directory for output
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_file = os.path.join(temp_dir, "lynis_report.dat")
+            log_file = os.path.join(temp_dir, "lynis_log.log")
+            
+            try:
+                start_time = time.time()
+                # Run Lynis audit
+                cmd = ["sudo", "lynis", "audit", "system", 
+                       "--no-colors", 
+                       f"--report-file={output_file}", 
+                       f"--log-file={log_file}"]
+                
+                result = subprocess.run(
+                    cmd, 
+                    capture_output=True, 
+                    text=True,
+                    timeout=600  # 10 minute timeout
+                )
+                
+                scan_duration = time.time() - start_time
+                raw_output = result.stdout
+                
+                # Parse results
+                warnings = []
+                suggestions = []
+                
+                if os.path.exists(output_file):
+                    with open(output_file, "r") as f:
+                        for line in f:
+                            if "warning[]" in line:
+                                warnings.append(line.split("=")[1].strip())
+                            elif "suggestion[]" in line:
+                                suggestions.append(line.split("=")[1].strip())
+                                
+                # Calculate statistics
+                warning_count = len(warnings)
+                suggestion_count = len(suggestions)
+                
+                return {
+                    "warnings": warnings,
+                    "suggestions": suggestions,
+                    "warning_count": warning_count,
+                    "suggestion_count": suggestion_count,
+                    "scan_duration": scan_duration,
+                    "raw_output": raw_output
+                }
+                
+            except subprocess.TimeoutExpired:
+                return {
+                    "error": "Lynis scan timed out after 10 minutes",
+                    "raw_output": ""
+                }
+            except Exception as e:
+                return {
+                    "error": f"Error running Lynis scan: {str(e)}",
+                    "raw_output": ""
+                }
+                
+    async def async_scan(self, target):
+        """Run Lynis scan asynchronously"""
+        # Create a coroutine that runs the scan in a separate thread
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, self.scan, target)

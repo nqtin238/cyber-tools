@@ -25,16 +25,40 @@ import sqlite3
 from scanners.nmap_scanner import NmapScanner
 from reporting.enhanced_html import EnhancedHTMLReport
 from integrations.cve_data import CVEDataProvider
+from utils.plugin_loader import load_scanner_plugins
 
-# Configure logging
-log_dir = "logs"
-os.makedirs(log_dir, exist_ok=True)
-log_file = os.path.join(log_dir, f"interactive_test_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
-logging.basicConfig(
-    filename=log_file,
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s"
+# New imports for logging
+from utils.logging_config import initialize_logging, get_logger, log_with_context
+
+# New imports for async functionality
+import asyncio
+from utils.scan_profiles import ScanProfileManager
+from utils.recommendation_engine import get_recommendations_for_results, get_risk_assessment_for_results
+from utils.real_time_feedback import create_progress_monitor
+from utils.workflow_manager import WorkflowManager, run_workflow_from_profile
+
+# Import ML predictor
+from utils.ml_prediction import MLVulnerabilityPredictor
+
+# Add PostExploitationModule-related imports
+from utils.post_exploitation import PostExploitationModule
+
+# Initialize logging with enhanced configuration
+initialize_logging(
+    level=os.environ.get("LOG_LEVEL", "INFO"),
+    app_name="interactive-system-tester",
+    sentry_dsn=os.environ.get("SENTRY_DSN"),
+    json_format=os.environ.get("JSON_LOGS", "").lower() == "true",
+    log_to_console=True,
+    log_to_file=True
 )
+
+# Get logger for this module
+logger = get_logger(__name__)
+
+# Log application startup
+logger.info("Interactive System Tester starting", 
+            extra={"version": "1.0", "platform": sys.platform})
 
 # Setup Jinja2 for HTML reporting
 env = Environment(loader=FileSystemLoader("templates"))
@@ -62,6 +86,39 @@ class InteractiveSystemTester:
         self.max_retries = 3
         self.automation_interval = 0  # Default: automation disabled (0 seconds)
         self.automation_thread = None
+
+        # Initialize new components
+        self.profile_manager = ScanProfileManager()
+        self.progress_monitor = None
+        self.workflow_manager = None
+        self.recommendations = []
+        self.use_workflow_system = True  # Enable workflow system by default
+        self.use_realtime_updates = True  # Enable real-time updates by default
+        self.selected_profile_id = None
+        
+        # Initialize ML predictor
+        self.use_ml_predictions = True  # Enable ML predictions by default
+        try:
+            self.ml_predictor = MLVulnerabilityPredictor()
+            self.logger.info("ML Vulnerability Predictor initialized successfully")
+        except Exception as e:
+            self.logger.error(f"Failed to initialize ML Vulnerability Predictor: {str(e)}")
+            self.use_ml_predictions = False
+            self.ml_predictor = None
+        
+        self.ml_risk_assessments = {}
+        self.ml_predictions = {}
+
+        # Initialize post-exploitation module
+        config_file = "post_exploitation_config.json"
+        self.post_exploit = PostExploitationModule(config_file=config_file)
+        self.authorized_token = None
+        self.active_exploit_sessions = {}
+        self.logger.info("Post-Exploitation Module initialized")
+
+        # Initialize logging for the instance
+        self.logger = get_logger(f"{__name__}.InteractiveSystemTester")
+        self.logger.info("Initializing Interactive System Tester")
 
     def setup_templates(self):
         """Create templates directory and basic HTML template if not exists"""
@@ -168,6 +225,8 @@ class InteractiveSystemTester:
                 </html>
                 """)
 
+        self.logger.debug("Setting up HTML templates")
+
     def setup_prompt(self):
         """Setup interactive prompt with autocompletion and keybindings"""
         self.style = Style.from_dict({
@@ -191,6 +250,18 @@ class InteractiveSystemTester:
             multiline=False,
             prompt_message=HTML('<prompt>SystemTester> </prompt>')
         )
+
+        # Add new commands to completer
+        self.completer = WordCompleter([
+            'all', 'network', 'vulnerability', 'exploitation', 'anonymity', 'auditing', 'wireless',
+            'yes', 'no', 'verbose', 'quiet', '127.0.0.1', 'lan',
+            'configure', 'targets', 'run', 'export', 'exit', 'query_db', 'enhanced_report', 
+            'configure_automation', 'create_profile', 'manage_profiles', 'show_recommendations',
+            'ml_predict', 'ml_risk_assessment', 'train_ml_model',
+            'text', 'html', 'enhanced_html', 'csv'
+        ], ignore_case=True)
+
+        self.logger.debug("Setting up interactive prompt")
 
     def setup_database(self):
         """Initialize SQLite database and create tables"""
@@ -242,8 +313,39 @@ class InteractiveSystemTester:
                 FOREIGN KEY (target_id) REFERENCES targets(id)
             )
         ''')
+        
+        # Add new table for ML predictions
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS ml_predictions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                target_id INTEGER,
+                service_name TEXT,
+                service_port INTEGER,
+                service_version TEXT,
+                probability REAL,
+                prediction TEXT,
+                potential_cves TEXT,
+                timestamp TEXT,
+                FOREIGN KEY (target_id) REFERENCES targets(id)
+            )
+        ''')
+        
+        # Add new table for ML risk assessments
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS ml_risk_assessments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                target_id INTEGER,
+                risk_score REAL,
+                risk_level TEXT,
+                recommendations TEXT,
+                timestamp TEXT,
+                FOREIGN KEY (target_id) REFERENCES targets(id)
+            )
+        ''')
+        
         self.conn.commit()
-        logging.info("SQLite database initialized")
+        self.logger.info(f"Setting up SQLite database: {self.db_file}")
+        self.logger.info("SQLite database initialized successfully")
 
     def store_target(self, ip, mac, os, version, ports):
         """Store discovered target in the database"""
@@ -261,6 +363,8 @@ class InteractiveSystemTester:
             ''', (target_id, port_info['port'], port_info['service'], port_info['version']))
 
         self.conn.commit()
+        self.logger.debug(f"Storing target in database: {ip}")
+        self.logger.debug(f"Target stored with ID {target_id}")
         return target_id
 
     def store_test_result(self, target_id, test_name, result):
@@ -271,6 +375,7 @@ class InteractiveSystemTester:
             VALUES (?, ?, ?, ?)
         ''', (target_id, test_name, result, timestamp))
         self.conn.commit()
+        self.logger.debug(f"Storing test result in database: {test_name} for target ID {target_id}")
 
     def store_vulnerability(self, target_id, port, script, output, cve, score, description):
         """Store vulnerability in the database"""
@@ -280,6 +385,27 @@ class InteractiveSystemTester:
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         ''', (target_id, port, script, output, cve, score, description, timestamp))
         self.conn.commit()
+        self.logger.debug(f"Storing vulnerability in database: {script} on port {port} for target ID {target_id}")
+
+    def store_ml_prediction(self, target_id, service_name, service_port, service_version, probability, prediction, potential_cves):
+        """Store ML prediction in the database"""
+        timestamp = datetime.now().isoformat()
+        self.cursor.execute('''
+            INSERT INTO ml_predictions (target_id, service_name, service_port, service_version, probability, prediction, potential_cves, timestamp)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (target_id, service_name, service_port, service_version, probability, prediction, json.dumps(potential_cves), timestamp))
+        self.conn.commit()
+        self.logger.debug(f"Storing ML prediction in database for service {service_name}:{service_port} on target ID {target_id}")
+
+    def store_ml_risk_assessment(self, target_id, risk_score, risk_level, recommendations):
+        """Store ML risk assessment in the database"""
+        timestamp = datetime.now().isoformat()
+        self.cursor.execute('''
+            INSERT INTO ml_risk_assessments (target_id, risk_score, risk_level, recommendations, timestamp)
+            VALUES (?, ?, ?, ?, ?)
+        ''', (target_id, risk_score, risk_level, json.dumps(recommendations), timestamp))
+        self.conn.commit()
+        self.logger.debug(f"Storing ML risk assessment in database for target ID {target_id}")
 
     def simulate_scan_data(self, num_targets=3):
         """Simulate scan data for automation"""
@@ -316,7 +442,7 @@ class InteractiveSystemTester:
                 description = f"Description for {cve or 'unknown vulnerability'}" if cve else None
                 self.store_vulnerability(target_id, vuln_port, vuln_script, vuln_output, cve, score, description)
 
-        logging.info(f"Simulated data for {num_targets} targets")
+        self.logger.info(f"Simulated data for {num_targets} targets")
         print(f"\033[92m[+] Simulated data for {num_targets} targets\033[0m")
 
     def automate_data_collection(self):
@@ -1296,6 +1422,65 @@ class InteractiveSystemTester:
         except Exception as e:
             logging.error(f"Error saving report: {str(e)}")
             print(f"\033[91m[!] Error saving report: {str(e)}\033[0m")
+            
+        # Add ML predictions and risk assessments to reports
+        if self.ml_predictions or self.ml_risk_assessments:
+            ml_report_file = f"ml_predictions_{timestamp}.json"
+            try:
+                # Prepare data for serialization
+                ml_data = {
+                    "predictions": {},
+                    "risk_assessments": {}
+                }
+                
+                # Process predictions
+                for target, preds in self.ml_predictions.items():
+                    ml_data["predictions"][target] = []
+                    for pred in preds:
+                        # Clean up prediction data for JSON serialization
+                        clean_pred = {
+                            "service_name": pred["service"].get("name", "unknown"),
+                            "service_port": pred["service"].get("port", 0),
+                            "service_version": pred["service"].get("version", ""),
+                            "probability": pred["probability"],
+                            "prediction": pred["prediction"],
+                            "potential_cves": []
+                        }
+                        
+                        # Add potential CVEs if available
+                        if "potential_cves" in pred:
+                            for cve in pred["potential_cves"]:
+                                clean_pred["potential_cves"].append({
+                                    "id": cve.get("id", ""),
+                                    "summary": cve.get("summary", ""),
+                                    "published": cve.get("published", "")
+                                })
+                        
+                        ml_data["predictions"][target].append(clean_pred)
+                
+                # Process risk assessments
+                for target, assess in self.ml_risk_assessments.items():
+                    if isinstance(assess, dict) and "error" not in assess:
+                        ml_data["risk_assessments"][target] = {
+                            "risk_score": assess.get("risk_score", 0),
+                            "risk_level": assess.get("risk_level", "Unknown"),
+                            "recommendations": assess.get("recommendations", []),
+                            "high_risk_services": [{
+                                "name": s.get("name", ""),
+                                "port": s.get("port", 0),
+                                "risk_score": s.get("risk_score", 0)
+                            } for s in assess.get("high_risk_services", [])]
+                        }
+                
+                # Save to file
+                with open(ml_report_file, "w") as f:
+                    json.dump(ml_data, f, indent=2)
+                
+                print(f"\033[92m[+] ML prediction report saved to {ml_report_file}\033[0m")
+                
+            except Exception as e:
+                self.logger.error(f"Error saving ML report: {str(e)}")
+                print(f"\033[91m[!] Error saving ML report: {str(e)}\033[0m")
 
     def export_reports(self):
         """Interactively export reports in selected formats"""
@@ -1332,7 +1517,15 @@ class InteractiveSystemTester:
 
     def generate_enhanced_report(self):
         """Generate enhanced HTML report with interactive elements"""
-        enhanced_report = EnhancedHTMLReport(self.conn)
+        # Add ML predictions to report data if available
+        if self.use_ml_predictions and (self.ml_predictions or self.ml_risk_assessments):
+            enhanced_report = EnhancedHTMLReport(self.conn, ml_data={
+                'predictions': self.ml_predictions,
+                'risk_assessments': self.ml_risk_assessments
+            })
+        else:
+            enhanced_report = EnhancedHTMLReport(self.conn)
+            
         report_file = enhanced_report.generate_report()
         self.last_report_files['enhanced_html'] = report_file
         return report_file
@@ -1382,6 +1575,31 @@ class InteractiveSystemTester:
             self.network_interface = self.get_default_interface()
             print(f"\033[94m[*] Using default interface: {self.network_interface}\033[0m")
         
+        # Post-exploitation configuration
+        if self.session.prompt(
+            HTML('<prompt>Configure post-exploitation? (yes/no): </prompt>'),
+            completer=WordCompleter(['yes', 'no'], ignore_case=True)
+        ).lower() == "yes":
+            token_input = self.session.prompt(
+                HTML('<prompt>Enter authorization token (required for post-exploitation): </prompt>')
+            )
+            if token_input:
+                self.authorized_token = token_input
+                self.post_exploit = PostExploitationModule(
+                    config_file="post_exploitation_config.json",
+                    authorization_token=self.authorized_token
+                )
+                print("\033[92m[+] Post-exploitation module authorized\033[0m")
+            else:
+                print("\033[93m[-] No token provided. Post-exploitation disabled.\033[0m")
+
+        if self.use_tor:
+            self.setup_anonymity()
+        if self.stealth_mode:
+            self.spoof_mac()
+        
+        print(f"\033[92m[+] Configured: Port Range={self.port_range}, Profile={self.profile}, Verbose={self.verbose}, Stealth={self.stealth_mode}, Tor={self.use_tor}, Interface={self.network_interface}\033[0m")
+
         # Special configuration for wireless testing
         if self.profile in ["all", "wireless"]:
             wireless_interfaces = self.get_wireless_interfaces()
@@ -1413,28 +1631,346 @@ class InteractiveSystemTester:
         
         print(f"\033[92m[+] Plugin system: {'Enabled' if self.use_plugin_system else 'Disabled'}\033[0m")
 
-    def get_available_interfaces(self):
-        """Get a list of all network interfaces"""
-        try:
-            result = subprocess.run("ip -o link show | grep -v 'link/loopback' | awk -F': ' '{print $2}'", 
-                                shell=True, capture_output=True, text=True)
-            interfaces = [iface.strip() for iface in result.stdout.splitlines() if iface.strip()]
-            return interfaces
-        except Exception as e:
-            logging.error(f"Failed to get network interfaces: {str(e)}")
-            return []
+        # Show available scan profiles
+        print("\033[94m[*] Available scan profiles:\033[0m")
+        profile_ids = self.profile_manager.get_available_profiles()
+        for idx, profile_id in enumerate(profile_ids):
+            profile = self.profile_manager.get_profile(profile_id)
+            if profile:
+                print(f"  {idx+1}. {profile['name']} - {profile['description']}")
+        
+        # Ask to use a predefined profile
+        use_profile = self.session.prompt(
+            HTML('<prompt>Use a predefined scan profile? (yes/no): </prompt>'),
+            completer=WordCompleter(['yes', 'no'], ignore_case=True)
+        ).lower()
+        
+        if use_profile == "yes":
+            profile_choice = self.session.prompt(
+                HTML('<prompt>Enter profile number or name: </prompt>')
+            )
+            
+            # Try to find profile by index or name
+            selected_profile = None
+            try:
+                # Try as index
+                idx = int(profile_choice) - 1
+                if 0 <= idx < len(profile_ids):
+                    selected_profile = self.profile_manager.get_profile(profile_ids[idx])
+                    self.selected_profile_id = profile_ids[idx]
+            except ValueError:
+                # Try as profile_id
+                if profile_choice in profile_ids:
+                    selected_profile = self.profile_manager.get_profile(profile_choice)
+                    self.selected_profile_id = profile_choice
+                else:
+                    # Try case-insensitive match
+                    for profile_id in profile_ids:
+                        if profile_id.lower() == profile_choice.lower():
+                            selected_profile = self.profile_manager.get_profile(profile_id)
+                            self.selected_profile_id = profile_id
+                            break
+            
+            if selected_profile:
+                # Apply profile settings
+                self.port_range = selected_profile.get("port_range", self.port_range)
+                self.profile = selected_profile.get("profile", self.profile)
+                self.stealth_mode = selected_profile.get("stealth_mode", self.stealth_mode)
+                self.max_concurrent = selected_profile.get("max_concurrent", 10)
+                print(f"\033[92m[+] Applied profile: {selected_profile['name']}\033[0m")
+            else:
+                print("\033[91m[!] Profile not found. Using manual configuration.\033[0m")
+                self.selected_profile_id = None
+        else:
+            self.selected_profile_id = None
+        
+        # Allow manual configuration/override of profile settings
+        self.port_range = self.session.prompt(
+            HTML(f'<prompt>Enter port range (default: {self.port_range}): </prompt>')
+        ) or self.port_range
+        
+        # ...existing code for other configuration settings...
 
-    def get_wireless_interfaces(self):
-        """Get a list of wireless interfaces"""
-        try:
-            result = subprocess.run("iwconfig 2>/dev/null | grep -o '^[a-zA-Z0-9]*'", 
-                                shell=True, capture_output=True, text=True)
-            interfaces = [iface.strip() for iface in result.stdout.splitlines() if iface.strip()]
-            return interfaces
-        except Exception as e:
-            logging.error(f"Failed to get wireless interfaces: {str(e)}")
-            return []
+        # Ask about workflow system
+        workflow_input = self.session.prompt(
+            HTML('<prompt>Use workflow system for coordinated scanning? (yes/no): </prompt>'),
+            completer=WordCompleter(['yes', 'no'], ignore_case=True)
+        ).lower()
+        self.use_workflow_system = workflow_input != "no"
+        
+        print(f"\033[92m[+] Workflow system: {'Enabled' if self.use_workflow_system else 'Disabled'}\033[0m")
+        
+        # Ask about real-time updates
+        realtime_input = self.session.prompt(
+            HTML('<prompt>Enable real-time scan updates? (yes/no): </prompt>'),
+            completer=WordCompleter(['yes', 'no'], ignore_case=True)
+        ).lower()
+        self.use_realtime_updates = realtime_input != "no"
+        
+        print(f"\033[92m[+] Real-time updates: {'Enabled' if self.use_realtime_updates else 'Disabled'}\033[0m")
+        
+        # Ask about ML predictions
+        ml_input = self.session.prompt(
+            HTML('<prompt>Enable ML-based vulnerability prediction? (yes/no): </prompt>'),
+            completer=WordCompleter(['yes', 'no'], ignore_case=True)
+        ).lower()
+        self.use_ml_predictions = ml_input != "no"
+        
+        if self.use_ml_predictions and self.ml_predictor is None:
+            try:
+                self.ml_predictor = MLVulnerabilityPredictor()
+                print("\033[92m[+] ML Vulnerability Predictor initialized successfully\033[0m")
+            except Exception as e:
+                print(f"\033[91m[!] Failed to initialize ML Vulnerability Predictor: {str(e)}\033[0m")
+                self.use_ml_predictions = False
+                
+        print(f"\033[92m[+] ML-based vulnerability prediction: {'Enabled' if self.use_ml_predictions else 'Disabled'}\033[0m")
 
+    # Post-exploitation methods
+    def deploy_post_exploit_backdoor(self, target):
+        """Deploy a post-exploitation backdoor on a target"""
+        if not self.authorized_token:
+            print("\033[91m[!] No authorization token configured. Please configure post-exploitation first.\033[0m")
+            return
+
+        result = self.post_exploit.deploy_backdoor(target)
+        if result['success']:
+            session_id = result['session_id']
+            self.active_exploit_sessions[session_id] = result['details']
+            print(f"\033[92m[+] Backdoor deployed successfully. Session ID: {session_id}\033[0m")
+            return session_id
+        else:
+            print(f"\033[91m[!] Failed to deploy backdoor: {result['error']}\033[0m")
+            return None
+
+    def execute_post_exploit_command(self, session_id, command):
+        """Execute a command through an existing post-exploitation session"""
+        if session_id not in self.active_exploit_sessions:
+            print("\033[91m[!] Invalid or inactive session ID\033[0m")
+            return
+
+        result = self.post_exploit.execute_command(session_id, command)
+        if result['success']:
+            print(f"\033[92m[+] Command executed successfully:\n{result['output']}\033[0m")
+        else:
+            print(f"\033[91m[!] Command execution failed: {result['error']}\033[0m")
+
+    def gather_post_exploit_evidence(self, session_id, evidence_type='system_info'):
+        """Gather evidence through an existing post-exploitation session"""
+        if session_id not in self.active_exploit_sessions:
+            print("\033[91m[!] Invalid or inactive session ID\033[0m")
+            return
+
+        result = self.post_exploit.gather_evidence(session_id, evidence_type)
+        if result['success']:
+            print(f"\033[92m[+] Evidence gathered successfully. Saved to: {result['evidence_dir']}\033[0m")
+        else:
+            print(f"\033[91m[!] Evidence gathering failed: {result['error']}\033[0m")
+
+    def exfiltrate_post_exploit_data(self, session_id, target_files):
+        """Exfiltrate data through an existing post-exploitation session"""
+        if session_id not in self.active_exploit_sessions:
+            print("\033[91m[!] Invalid or inactive session ID\033[0m")
+            return
+
+        result = self.post_exploit.exfiltrate_data(session_id, target_files)
+        if result['success']:
+            print(f"\033[92m[+] Data exfiltrated successfully. Saved to: {result['destination']}\033[0m")
+            print(f"Successful: {len(result['exfiltration_results']['successful'])}, Failed: {len(result['exfiltration_results']['failed'])}")
+        else:
+            print(f"\033[91m[!] Data exfiltration failed: {result['error']}\033[0m")
+
+    def cleanup_post_exploit_session(self, session_id):
+        """Clean up a post-exploitation session"""
+        if session_id not in self.active_exploit_sessions:
+            print("\033[91m[!] Invalid or inactive session ID\033[0m")
+            return
+
+        result = self.post_exploit.cleanup_session(session_id)
+        if result['success']:
+            del self.active_exploit_sessions[session_id]
+            print(f"\033[92m[+] Session cleaned up: {result['message']}\033[0m")
+        else:
+            print(f"\033[91m[!] Cleanup failed: {result['error']}\033[0m")
+
+    def generate_post_exploit_report(self):
+        """Generate a post-exploitation report"""
+        result = self.post_exploit.generate_execution_report(report_format='html')
+        if result['success']:
+            print(f"\033[92m[+] Report generated at: {result['report_path']}\033[0m")
+        else:
+            print(f"\033[91m[!] Report generation failed: {result['error']}\033[0m")
+
+    # Add a new method to create/save scan profiles
+    def create_scan_profile(self):
+        """Interactively create and save a scan profile"""
+        print("\n\033[94m=== Create Scan Profile ===\033[0m")
+        
+        # Get profile name
+        profile_name = self.session.prompt(HTML('<prompt>Enter profile name: </prompt>'))
+        if not profile_name:
+            print("\033[91m[!] Profile name is required. Aborting.\033[0m")
+            return
+        
+        # Create a profile ID from the name
+        profile_id = profile_name.lower().replace(" ", "_")
+        
+        # Get profile description
+        description = self.session.prompt(HTML('<prompt>Enter profile description: </prompt>'))
+        if not description:
+            description = f"Custom profile created on {datetime.now().strftime('%Y-%m-%d')}"
+        
+        # Get other profile settings
+        profile_data = {
+            "name": profile_name,
+            "description": description,
+            "port_range": self.session.prompt(HTML('<prompt>Enter port range (default: 1-1024): </prompt>')) or "1-1024",
+            "stealth_mode": self.session.prompt(HTML('<prompt>Enable stealth mode? (yes/no): </prompt>')).lower() == "yes",
+            "max_concurrent": int(self.session.prompt(HTML('<prompt>Max concurrent tasks (default: 5): </prompt>')) or "5"),
+        }
+        
+        # Configure scanners to use
+        available_plugins = load_scanner_plugins()
+        print("\n\033[94m[*] Available scanners:\033[0m")
+        for i, scanner_name in enumerate(available_plugins):
+            print(f"  {i+1}. {scanner_name}")
+        
+        selected_scanners = self.session.prompt(
+            HTML('<prompt>Enter scanner numbers or names (comma-separated): </prompt>')
+        )
+        
+        scanners_list = []
+        if selected_scanners:
+            for item in selected_scanners.split(","):
+                item = item.strip()
+                try:
+                    # Try as index
+                    idx = int(item) - 1
+                    if 0 <= idx < len(available_plugins):
+                        scanners_list.append(list(available_plugins.keys())[idx])
+                except ValueError:
+                    # Try as name
+                    if item in available_plugins:
+                        scanners_list.append(item)
+        
+        profile_data["scanners"] = scanners_list
+        
+        # Configure workflow
+        workflow_steps = []
+        print("\n\033[94m[*] Now let's configure the workflow steps\033[0m")
+        print("    (specify the order of scanners and any special options per step)")
+        
+        for scanner in scanners_list:
+            step = {"scanner": scanner, "options": {}}
+            
+            # Ask for scanner-specific options
+            if scanner == "NmapScanner":
+                step["options"]["port_range"] = profile_data["port_range"]
+                step["options"]["stealth"] = profile_data["stealth_mode"]
+            elif scanner == "NiktoScanner":
+                step["options"]["deep_scan"] = self.session.prompt(
+                    HTML(f'<prompt>Deep scan for {scanner}? (yes/no): </prompt>')
+                ).lower() == "yes"
+            elif scanner == "SQLMapScanner":
+                step["options"]["risk"] = int(self.session.prompt(
+                    HTML(f'<prompt>Risk level for {scanner} (1-3): </prompt>')
+                ) or "1")
+            
+            workflow_steps.append(step)
+        
+        # Create the workflow
+        profile_data["workflow"] = {
+            "name": f"{profile_name} Workflow",
+            "steps": workflow_steps
+        }
+        
+        # Save the profile
+        if self.profile_manager.save_profile(profile_id, profile_data):
+            print(f"\033[92m[+] Profile '{profile_name}' saved successfully\033[0m")
+        else:
+            print(f"\033[91m[!] Failed to save profile '{profile_name}'\033[0m")
+
+    def manage_profiles(self):
+        """Manage existing scan profiles"""
+        print("\n\033[94m=== Manage Scan Profiles ===\033[0m")
+        
+        # Show available profiles
+        profile_ids = self.profile_manager.get_available_profiles()
+        if not profile_ids:
+            print("\033[93m[-] No profiles found.\033[0m")
+            return
+        
+        print("\033[94m[*] Available profiles:\033[0m")
+        for idx, profile_id in enumerate(profile_ids):
+            profile = self.profile_manager.get_profile(profile_id)
+            if profile:
+                print(f"  {idx+1}. {profile['name']} - {profile['description']}")
+        
+        # Ask for action
+        action = self.session.prompt(
+            HTML('<prompt>Choose action (view/delete/export/back): </prompt>'),
+            completer=WordCompleter(['view', 'delete', 'export', 'back'], ignore_case=True)
+        ).lower()
+        
+        if action == "back":
+            return
+        
+        # Get profile selection
+        profile_choice = self.session.prompt(HTML('<prompt>Enter profile number or name: </prompt>'))
+        
+        # Find the selected profile
+        selected_profile_id = None
+        try:
+            # Try as index
+            idx = int(profile_choice) - 1
+            if 0 <= idx < len(profile_ids):
+                selected_profile_id = profile_ids[idx]
+        except ValueError:
+            # Try as profile_id
+            if profile_choice in profile_ids:
+                selected_profile_id = profile_choice
+            else:
+                # Try case-insensitive match
+                for profile_id in profile_ids:
+                    if profile_id.lower() == profile_choice.lower():
+                        selected_profile_id = profile_id
+                        break
+        
+        if not selected_profile_id:
+            print("\033[91m[!] Profile not found.\033[0m")
+            return
+            
+        selected_profile = self.profile_manager.get_profile(selected_profile_id)
+        
+        # Perform the selected action
+        if action == "view":
+            print(f"\n\033[94m=== Profile: {selected_profile['name']} ===\033[0m")
+            print(json.dumps(selected_profile, indent=2))
+        
+        elif action == "delete":
+            confirm = self.session.prompt(
+                HTML(f'<prompt>Are you sure you want to delete "{selected_profile["name"]}"? (yes/no): </prompt>'),
+                completer=WordCompleter(['yes', 'no'], ignore_case=True)
+            ).lower()
+            
+            if confirm == "yes":
+                if self.profile_manager.delete_profile(selected_profile_id):
+                    print(f"\033[92m[+] Profile '{selected_profile['name']}' deleted successfully\033[0m")
+                else:
+                    print(f"\033[91m[!] Failed to delete profile '{selected_profile['name']}'\033[0m")
+        
+        elif action == "export":
+            filename = self.session.prompt(
+                HTML(f'<prompt>Enter filename to export (default: {selected_profile_id}.json): </prompt>')
+            ) or f"{selected_profile_id}.json"
+            
+            try:
+                with open(filename, 'w') as f:
+                    json.dump(selected_profile, f, indent=2)
+                print(f"\033[92m[+] Profile exported to {filename}\033[0m")
+            except Exception as e:
+                print(f"\033[91m[!] Failed to export profile: {str(e)}\033[0m")
+    
     def run_profile(self):
         """Run tests based on selected profile with enhanced parallel execution"""
         valid_profiles = ["all", "network", "vulnerability", "exploitation", "anonymity", "auditing", "wireless"]
@@ -1448,267 +1984,493 @@ class InteractiveSystemTester:
             self.nmap_results[target] = {'ports': [], 'vulnerabilities': []}
 
         try:
-            if self.use_plugin_system:
-                # Import the dynamic plugin loader and parallel executor
-                from utils.plugin_loader import load_scanner_plugins
-                from utils.parallel_executor import ParallelExecutor, ScanTask
-                from tqdm import tqdm
-                
-                # Load all available plugins
-                plugins = load_scanner_plugins()
-                
-                # Prepare base options for all plugins
-                base_options = {
-                    'port_range': self.port_range,
-                    'stealth_mode': self.stealth_mode,
-                    'use_tor': self.use_tor,
-                    'verbose': self.verbose,
-                    'network_interface': self.network_interface
-                }
-                
-                # Configure scanner selection based on profile
-                selected_scanners = []
-                
-                if self.profile == "all":
-                    # Use all available plugins for "all" profile
-                    selected_scanners = list(plugins.values())
-                else:
-                    # Use profile-specific plugins
-                    if self.profile == "network":
-                        selected_names = ["NmapScanner", "MasscanScanner", "NetcatScanner"]
-                    elif self.profile == "vulnerability":
-                        selected_names = ["NiktoScanner", "SQLMapScanner", "MetasploitScanner"]
-                    elif self.profile == "exploitation":
-                        selected_names = ["MetasploitScanner", "JohnScanner"]
-                    elif self.profile == "anonymity":
-                        selected_names = ["AnonSurfScanner"]
-                    elif self.profile == "auditing":
-                        selected_names = ["LynisScanner", "ChkrootkitScanner"]
-                    elif self.profile == "wireless":
-                        selected_names = ["AircrackScanner"]
-                    
-                    selected_scanners = [plugins[name] for name in selected_names if name in plugins]
-                
-                # Set up tasks for parallel execution
-                scan_tasks = []
-                
-                # Init progress bar
-                total_tasks = len(self.targets) * len(selected_scanners)
-                progress_bar = tqdm(total=total_tasks, desc="Scanning Progress", 
-                                bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]")
-                
-                # Create executor with max workers based on target count and scan type
-                executor = ParallelExecutor(
-                    max_workers=min(10, len(self.targets) * 2),
-                    cpu_intensive=(self.profile in ["auditing", "exploitation"])
-                )
-                
-                # Define progress callback for updating tqdm
-                def update_progress(description, completed, total):
-                    progress_bar.set_description(description)
-                    progress_bar.update(1)
-                
-                executor.set_progress_callback(update_progress)
-                
-                # Create tasks for all targets and scanners
-                for target in self.targets:
-                    for scanner_class in selected_scanners:
-                        # Skip auditing tools for non-local targets
-                        if scanner_class.__name__ in ["LynisScanner", "ChkrootkitScanner"] and \
-                        target not in ["127.0.0.1", "localhost", "::1"]:
-                            continue
-                        
-                        # Prepare custom options for specific scanners
-                        custom_options = base_options.copy()
-                        
-                        # Special handling for certain scanners
-                        if scanner_class.__name__ == "MetasploitScanner" and \
-                        target in self.nmap_results and 'ports' in self.nmap_results[target]:
-                            custom_options['port_info'] = self.nmap_results[target]['ports']
-                        
-                        elif scanner_class.__name__ == "JohnScanner":
-                            # John needs a hash file
-                            if not hasattr(self, 'hash_file') or not self.hash_file:
-                                if self.verbose:
-                                    print(f"\033[93m[-] Skipping JohnScanner: No hash file provided\033[0m")
-                                continue
-                            custom_options['hash_file'] = self.hash_file
-                            if hasattr(self, 'wordlist') and self.wordlist:
-                                custom_options['wordlist'] = self.wordlist
-                        
-                        elif scanner_class.__name__ == "AircrackScanner":
-                            # Special options for wireless scanning
-                            custom_options['scan_duration'] = 30  # 30 seconds scan duration
-                        
-                        # Set task priority - network scanners first, then vuln scanners, etc.
-                        priority = 0
-                        if scanner_class.__name__ in ["NmapScanner", "MasscanScanner"]:
-                            priority = 100  # Highest priority
-                        elif "vulnerability" in self.profile:
-                            priority = 50
-                        
-                        # Create and add the task
-                        task = ScanTask(
-                            target=target, 
-                            scanner_class=scanner_class, 
-                            scanner_options=custom_options,
-                            priority=priority
-                        )
-                        executor.add_task(task)
-                
-                # Execute all tasks in parallel
-                print(f"\033[94m[*] Running {total_tasks} scan tasks on {len(self.targets)} targets using {executor.max_workers} parallel workers\033[0m")
-                parallel_results = executor.execute()
-                progress_bar.close()
-                
-                # Process results
-                for target, scanners in parallel_results.items():
-                    self.results[target] = scanners
-                    
-                    # Copy data from NmapScanner to nmap_results for compatibility
-                    if "NmapScanner" in scanners:
-                        nmap_results = scanners["NmapScanner"]
-                        self.nmap_results[target]['ports'] = nmap_results.get('ports', [])
-                        self.nmap_results[target]['vulnerabilities'] = nmap_results.get('vulnerabilities', [])
-                    
-                    # Process all vulnerabilities for database storage
-                    for scanner_name, results in scanners.items():
-                        if 'error' in results:
-                            logging.error(f"Error in {scanner_name} on {target}: {results['error']}")
-                            if self.verbose:
-                                print(f"\033[91m[!] Error in {scanner_name} on {target}: {results['error']}\033[0m")
-                            continue
-                            
-                        # Process vulnerabilities
-                        if 'vulnerabilities' in results and results['vulnerabilities']:
-                            self._process_vulnerabilities(target, scanner_name, results['vulnerabilities'])
-                        
-                        # Store test result in database
-                        self._store_scan_result(target, scanner_name, results)
-                
-                print(f"\033[92m[+] Completed all scan tasks\033[0m")
-                
+            # Initialize progress monitoring if enabled
+            if self.use_realtime_updates:
+                self.progress_monitor = create_progress_monitor(console_output=True)
+                print("\033[94m[*] Real-time progress monitoring enabled\033[0m")
+            
+            # Use workflow system if enabled and a profile is selected
+            if self.use_workflow_system and self.selected_profile_id:
+                print(f"\033[94m[*] Running workflow scan using profile '{self.selected_profile_id}'\033[0m")
+                success = self.run_workflow_scan()
+                if not success:
+                    # Fall back to standard scan method
+                    print("\033[93m[-] Falling back to standard scan method\033[0m")
+                    self.run_legacy_scan()
+            elif self.use_plugin_system:
+                print(f"\033[94m[*] Running plugin-based scan with profile '{self.profile}'\033[0m")
+                self.run_plugin_scan()
             else:
-                # Fall back to the original implementation if plugin system is disabled
-                for target in self.targets:
-                    self.run_scanner_plugins(target)
-                    
-                    # For backward compatibility, copy data from plugin results to nmap_results
-                    if 'NmapScanner' in self.results[target]:
-                        nmap_results = self.results[target]['NmapScanner']
-                        self.nmap_results[target]['ports'] = nmap_results.get('ports', [])
-                        self.nmap_results[target]['vulnerabilities'] = nmap_results.get('vulnerabilities', [])
-
-                # Keep existing code for tools not yet converted to plugins
-                if self.profile == "all" or self.profile == "exploitation":
-                    self.run_metasploit()
-                    self.run_john()
-
-                if self.profile == "all" or self.profile == "anonymity":
-                    self.check_anonsurf()
-
-                if self.profile == "all" or self.profile == "auditing":
-                    self.run_lynis()
-                    self.run_chkrootkit()
-                    self.gather_system_info(self.targets[0])
+                print(f"\033[94m[*] Running standard scan with profile '{self.profile}'\033[0m")
+                # Use original implementation
+                self.run_legacy_scan()
+                
+            # Generate recommendations regardless of scan method
+            if self.results:
+                self.recommendations = get_recommendations_for_results(self.results)
+                print(f"\033[92m[+] Generated {len(self.recommendations)} security recommendations\033[0m")
+                
+                # Generate ML-based risk assessment if enabled
+                if self.use_ml_predictions:
+                    print("\033[94m[*] Generating ML-based risk assessment...\033[0m")
+                    try:
+                        self.ml_risk_assessments = get_risk_assessment_for_results(self.results)
+                        num_assessments = len([v for v in self.ml_risk_assessments.values() if not (isinstance(v, dict) and 'error' in v)])
+                        print(f"\033[92m[+] Generated ML-based risk assessments for {num_assessments} targets\033[0m")
+                    except Exception as e:
+                        self.logger.error(f"Error generating ML risk assessment: {str(e)}")
+                        print(f"\033[91m[!] Error generating ML risk assessment: {str(e)}\033[0m")
+                
+            # Generate reports
+            self.save_report()
+            self.generate_enhanced_report()
+            
         except Exception as e:
             logging.error(f"Error in run_profile: {str(e)}")
             print(f"\033[91m[!] Error in test execution: {str(e)}. Continuing with remaining tests...\033[0m")
+        finally:
+            # Stop progress monitoring
+            if self.progress_monitor:
+                self.progress_monitor.stop()
+                self.progress_monitor = None
 
-        # Generate reports
-        self.save_report()
-        self.generate_enhanced_report()
-
-    def _process_vulnerabilities(self, target, scanner_name, vulnerabilities):
-        """Process and store vulnerabilities in the database"""
-        # Get target ID from database
-        self.cursor.execute("SELECT id FROM targets WHERE ip = ?", (target,))
-        target_id = self.cursor.fetchone()
+    def run_workflow_scan(self):
+        """Run scan using the workflow system"""
+        profile = self.profile_manager.get_profile(self.selected_profile_id)
+        if not profile or not profile.get("workflow"):
+            print(f"\033[91m[!] Profile {self.selected_profile_id} doesn't have a valid workflow. Falling back to standard scanning.\033[0m")
+            return False
         
-        if not target_id:
-            return
+        try:
+            # Create an event loop if none exists
+            try:
+                loop = asyncio.get_event_loop()
+            except RuntimeError:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
             
-        for vuln in vulnerabilities:
-            # Fetch CVE details if available
-            cve_details = {'score': 0, 'description': ''}
-            if vuln.get('cve'):
-                cve_details = self.fetch_cve_details(vuln['cve'])
-                
-            # Store vulnerability in database
-            self.store_vulnerability(
-                target_id[0],
-                vuln.get('port', 0),
-                vuln.get('script', scanner_name),
-                vuln.get('output', 'No output'),
-                vuln.get('cve'),
-                cve_details.get('score', 0),
-                cve_details.get('description', '')
+            # Initialize workflow manager
+            self.workflow_manager = WorkflowManager(self.progress_monitor)
+            
+            # Run the workflow from profile
+            workflow_results = loop.run_until_complete(
+                run_workflow_from_profile(profile, self.targets, self.progress_monitor)
             )
-
-    def _store_scan_result(self, target, scanner_name, results):
-        """Store scan results in the database"""
-        # Get target ID
-        self.cursor.execute("SELECT id FROM targets WHERE ip = ?", (target,))
-        target_id = self.cursor.fetchone()
-        
-        if not target_id:
-            return
             
-        # Create a summary result message
-        result_summary = f"[SUCCESS] {scanner_name}\n"
+            # Store results in standard format
+            for target, target_results in workflow_results.items():
+                self.results[target] = target_results
+                
+                # Extract Nmap results for compatibility with other functions
+                if "NmapScanner" in target_results:
+                    self.nmap_results[target] = {
+                        'ports': target_results["NmapScanner"].get('ports', []),
+                        'vulnerabilities': target_results["NmapScanner"].get('vulnerabilities', [])
+                    }
+                
+                # Store data in database
+                self._store_scan_results(target, target_results)
+            
+            print(f"\033[92m[+] Workflow scan completed successfully\033[0m")
+            return True
+            
+        except Exception as e:
+            logging.error(f"Error in workflow scan: {str(e)}")
+            print(f"\033[91m[!] Error in workflow scan: {str(e)}. Falling back to standard scanning.\033[0m")
+            return False
+    
+    def _store_scan_results(self, target, target_results):
+        """Store scan results in the database"""
+        # Get or create target record
+        self.cursor.execute("SELECT id FROM targets WHERE ip = ?", (target,))
+        target_record = self.cursor.fetchone()
         
-        # Add details based on scanner type
-        if scanner_name == 'NmapScanner' and 'ports' in results:
-            result_summary += f"Found {len(results['ports'])} open ports\n"
-        elif scanner_name == 'NiktoScanner' and 'vulnerabilities' in results:
-            result_summary += f"Found {len(results['vulnerabilities'])} web vulnerabilities\n"
-        elif scanner_name == 'LynisScanner':
-            result_summary += f"Found {len(results.get('warnings', []))} warnings and {len(results.get('suggestions', []))} suggestions\n"
-        elif scanner_name == 'ChkrootkitScanner':
-            result_summary += f"Found {len(results.get('infected', []))} infections and {len(results.get('suspicious', []))} suspicious items\n"
-        elif scanner_name == 'JohnScanner':
-            result_summary += f"Cracked {len(results.get('cracked_passwords', []))} passwords\n"
-        elif scanner_name == 'AnonSurfScanner':
-            result_summary += f"Anonymity status: {results.get('anonymity_status', 'Unknown')}\n"
-        elif scanner_name == 'AircrackScanner':
-            result_summary += f"Found {len(results.get('networks', []))} wireless networks and {len(results.get('vulnerabilities', []))} vulnerabilities\n"
+        if not target_record:
+            # Create a new target record
+            timestamp = datetime.now().isoformat()
+            
+            # Try to extract additional info from nmap results
+            mac = None
+            os_name = None
+            version = None
+            if "NmapScanner" in target_results:
+                nmap_results = target_results["NmapScanner"]
+                host_info = nmap_results.get("host_info", {})
+                mac = host_info.get("mac")
+                os_info = nmap_results.get("os_info", {})
+                os_name = os_info.get("name")
+                version = os_info.get("version")
+            
+            self.cursor.execute(
+                "INSERT INTO targets (ip, mac, os, version, scan_timestamp) VALUES (?, ?, ?, ?, ?)",
+                (target, mac, os_name, version, timestamp)
+            )
+            target_id = self.cursor.lastrowid
+        else:
+            target_id = target_record[0]
         
-        # Add raw output excerpt (first 500 chars)
-        if 'raw_output' in results and results['raw_output']:
-            excerpt = results['raw_output'][:500] + "..." if len(results['raw_output']) > 500 else results['raw_output']
-            result_summary += f"\nOutput excerpt:\n{excerpt}\n"
+        # Store ports
+        if "NmapScanner" in target_results and "ports" in target_results["NmapScanner"]:
+            for port_info in target_results["NmapScanner"]["ports"]:
+                self.cursor.execute(
+                    "INSERT INTO ports (target_id, port, service, version) VALUES (?, ?, ?, ?)",
+                    (target_id, port_info['port'], port_info.get('service', ''), port_info.get('version', ''))
+                )
         
-        # Store in database
-        self.store_test_result(target_id[0], scanner_name, result_summary)
+        # Store vulnerabilities
+        for scanner_name, scanner_results in target_results.items():
+            if isinstance(scanner_results, dict) and "vulnerabilities" in scanner_results:
+                for vuln in scanner_results["vulnerabilities"]:
+                    # Get CVE details if available
+                    cve_details = {"score": 0, "description": ""}
+                    if vuln.get("cve"):
+                        cve_details = self.fetch_cve_details(vuln["cve"])
+                    
+                    self.store_vulnerability(
+                        target_id,
+                        vuln.get("port", 0),
+                        vuln.get("script", scanner_name),
+                        vuln.get("output", "No output"),
+                        vuln.get("cve"),
+                        cve_details.get("score", 0),
+                        cve_details.get("description", "")
+                    )
+        
+        # Store test results
+        for scanner_name, scanner_results in target_results.items():
+            if isinstance(scanner_results, dict):
+                # Create a summary
+                result_summary = f"[SUCCESS] {scanner_name}\n"
+                
+                # Add scanner-specific details
+                if scanner_name == "NmapScanner" and "ports" in scanner_results:
+                    result_summary += f"Found {len(scanner_results['ports'])} open ports\n"
+                elif "vulnerabilities" in scanner_results:
+                    result_summary += f"Found {len(scanner_results['vulnerabilities'])} vulnerabilities\n"
+                
+                # Add output if available
+                if "raw_output" in scanner_results:
+                    excerpt_len = 500
+                    raw_output = scanner_results["raw_output"]
+                    excerpt = raw_output[:excerpt_len] + "..." if len(raw_output) > excerpt_len else raw_output
+                    result_summary += f"\nOutput excerpt:\n{excerpt}\n"
+                
+                # Store in database
+                self.store_test_result(target_id, scanner_name, result_summary)
+
+    def show_recommendations(self):
+        """Show recommendations based on scan results"""
+        if not self.recommendations:
+            print("\033[93m[-] No recommendations available. Run a scan first.\033[0m")
+            return
+        
+        print("\n\033[94m=== Security Recommendations ===\033[0m")
+        
+        # Group recommendations by severity
+        severity_groups = {"critical": [], "high": [], "medium": [], "low": [], "info": []}
+        
+        for rec in self.recommendations:
+            severity = rec.get("severity", "info").lower()
+            if severity in severity_groups:
+                severity_groups[severity].append(rec)
+            else:
+                severity_groups["info"].append(rec)
+        
+        # Display recommendations by severity
+        for severity in ["critical", "high", "medium", "low", "info"]:
+            group = severity_groups[severity]
+            if not group:
+                continue
+                
+            # Choose color based on severity
+            if severity == "critical":
+                color = "\033[91m"  # Red
+            elif severity == "high":
+                color = "\033[93m"  # Yellow
+            elif severity == "medium":
+                color = "\033[95m"  # Magenta
+            elif severity == "low":
+                color = "\033[94m"  # Blue
+            else:
+                color = "\033[92m"  # Green
+                
+            print(f"\n{color}=== {severity.upper()} SEVERITY RECOMMENDATIONS ({len(group)}) ===\033[0m")
+            
+            for i, rec in enumerate(group):
+                target = rec.get("target", "general")
+                print(f"\n{color}{i+1}. {rec['title']}\033[0m")
+                print(f"   Target: {target}")
+                print(f"   Details: {rec['details']}")
+                
+                if "actions" in rec:
+                    print("   Recommended actions:")
+                    for action in rec["actions"]:
+                        print(f"    * {action}")
+    
+        # Ask if user wants to save recommendations
+        save_option = self.session.prompt(
+            HTML('<prompt>Save recommendations to file? (yes/no): </prompt>'),
+            completer=WordCompleter(['yes', 'no'], ignore_case=True)
+        ).lower()
+        
+        if save_option == "yes":
+            filename = self.session.prompt(
+                HTML('<prompt>Enter filename (default: recommendations.txt): </prompt>')
+            ) or "recommendations.txt"
+            
+            try:
+                with open(filename, 'w') as f:
+                    f.write(f"Security Recommendations - {datetime.now().isoformat()}\n\n")
+                    
+                    # Write recommendations by severity
+                    for severity in ["critical", "high", "medium", "low", "info"]:
+                        group = severity_groups[severity]
+                        if not group:
+                            continue
+                        
+                        f.write(f"\n=== {severity.upper()} SEVERITY RECOMMENDATIONS ({len(group)}) ===\n\n")
+                        
+                        for i, rec in enumerate(group):
+                            target = rec.get("target", "general")
+                            f.write(f"{i+1}. {rec['title']}\n")
+                            f.write(f"   Target: {target}\n")
+                            f.write(f"   Details: {rec['details']}\n")
+                            
+                            if "actions" in rec:
+                                f.write("   Recommended actions:\n")
+                                for action in rec["actions"]:
+                                    f.write(f"    * {action}\n")
+                            f.write("\n")
+                
+                print(f"\033[92m[+] Recommendations saved to {filename}\033[0m")
+            except Exception as e:
+                print(f"\033[91m[!] Error saving recommendations: {str(e)}\033[0m")
+
+    def save_report_with_recommendations(self, formats=None):
+        """Save results to specified formats with recommendations included"""
+        if not formats:
+            formats = ['text', 'html', 'csv']
+
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        report_file = f"interactive_test_report_{timestamp}.txt"
+        html_report_file = f"interactive_test_report_{timestamp}.html"
+        csv_report_file = f"interactive_test_report_{timestamp}.csv"
+
+        # Fetch data from database
+        # ...existing report generation code...
+
+        # Add recommendations section to reports
+        try:
+            if 'text' in formats:
+                with open(report_file, "w") as f:
+                    # ...existing text report code...
+                    
+                    # Add recommendations section
+                    if self.recommendations:
+                        f.write("\n\nSECURITY RECOMMENDATIONS\n")
+                        f.write("=" * 50 + "\n\n")
+                        
+                        # Group by severity
+                        severity_groups = {"critical": [], "high": [], "medium": [], "low": [], "info": []}
+                        for rec in self.recommendations:
+                            severity = rec.get("severity", "info").lower()
+                            if severity in severity_groups:
+                                severity_groups[severity].append(rec)
+                            
+                        # Write by severity
+                        for severity in ["critical", "high", "medium", "low", "info"]:
+                            group = severity_groups[severity]
+                            if not group:
+                                continue
+                                
+                            f.write(f"{severity.upper()} SEVERITY RECOMMENDATIONS ({len(group)})\n")
+                            f.write("-" * 40 + "\n")
+                            
+                            for i, rec in enumerate(group):
+                                target = rec.get("target", "general")
+                                f.write(f"{i+1}. {rec['title']}\n")
+                                f.write(f"   Target: {target}\n")
+                                f.write(f"   Details: {rec['details']}\n")
+                                
+                                if "actions" in rec:
+                                    f.write("   Recommended actions:\n")
+                                    for action in rec["actions"]:
+                                        f.write(f"    * {action}\n")
+                                f.write("\n")
+
+            if 'html' in formats:
+                # ...existing HTML report code...
+                
+                # Update template to include recommendations
+                template = env.get_template("report.html")
+                html_content = template.render(
+                    timestamp=datetime.now().isoformat(),
+                    results=self.results,
+                    targets=list(target_ports.values()),
+                    test_results=test_results,
+                    vulnerabilities=vulnerabilities,
+                    recommendations=self.recommendations
+                )
+                
+                # ...save HTML report...
+            
+            # ...existing report code for other formats...
+        except Exception as e:
+            logging.error(f"Error saving report: {str(e)}")
+            print(f"\033[91m[!] Error saving report: {str(e)}\033[0m")
+
+    def analyze_with_ml_predictions(self, target=None):
+        """Run ML-based vulnerability predictions on a target or all targets"""
+        if not self.use_ml_predictions or not self.ml_predictor:
+            print("\033[93m[-] ML-based prediction is not enabled or initialized\033[0m")
+            return
+        
+        targets_to_analyze = [target] if target else self.targets
+        if not targets_to_analyze:
+            print("\033[93m[-] No targets selected for ML analysis\033[0m")
+            return
+        
+        print("\033[94m[*] Running ML-based vulnerability predictions...\033[0m")
+        
+        for target in targets_to_analyze:
+            if target not in self.results:
+                print(f"\033[93m[-] No scan results available for {target}\033[0m")
+                continue
+                
+            # Extract service information
+            services = []
+            if "NmapScanner" in self.results[target] and "ports" in self.results[target]["NmapScanner"]:
+                for port_info in self.results[target]["NmapScanner"]["ports"]:
+                    services.append({
+                        'name': port_info.get('service', 'unknown'),
+                        'version': port_info.get('version', ''),
+                        'port': port_info.get('port', 0)
+                    })
+            
+            if not services:
+                print(f"\033[93m[-] No service information available for {target}\033[0m")
+                continue
+                
+            try:
+                # Get ML predictions
+                predictions = self.ml_predictor.predict_service_vulnerabilities(services)
+                self.ml_predictions[target] = predictions
+                
+                # Display predictions
+                print(f"\n\033[94m=== ML Predictions for {target} ===\033[0m")
+                if predictions:
+                    for pred in predictions:
+                        service = pred['service']
+                        prob = pred['probability']
+                        
+                        # Choose color based on probability
+                        if prob > 0.7:
+                            color = "\033[91m"  # Red for high probability
+                        elif prob > 0.5:
+                            color = "\033[93m"  # Yellow for medium probability
+                        else:
+                            color = "\033[92m"  # Green for low probability
+                        
+                        print(f"{color}Service: {service['name']} on port {service['port']}")
+                        print(f"Version: {service.get('version', 'unknown')}")
+                        print(f"Vulnerability probability: {prob:.2f}")
+                        print(f"Prediction: {pred['prediction']}\033[0m")
+                        
+                        if pred.get('potential_cves'):
+                            print("Potential CVEs:")
+                            for cve in pred['potential_cves'][:3]:  # Show top 3 CVEs
+                                print(f"  - {cve['id']}: {cve['summary']}")
+                        print()
+                else:
+                    print("\033[92m[+] No significant vulnerabilities predicted\033[0m")
+                    
+                # Get risk assessment
+                if target in self.ml_risk_assessments:
+                    assessment = self.ml_risk_assessments[target]
+                    if isinstance(assessment, dict) and 'risk_level' in assessment:
+                        # Choose color based on risk level
+                        if assessment['risk_level'] == 'Critical':
+                            color = "\033[91m"  # Red
+                        elif assessment['risk_level'] == 'High':
+                            color = "\033[93m"  # Yellow
+                        elif assessment['risk_level'] == 'Medium':
+                            color = "\033[95m"  # Magenta
+                        else:
+                            color = "\033[92m"  # Green
+                            
+                        print(f"{color}Overall Risk Assessment:")
+                        print(f"Risk Level: {assessment['risk_level']} ({assessment['risk_score']:.1f}/100)")
+                        if assessment.get('high_risk_services'):
+                            print("High-risk services:")
+                            for service in assessment['high_risk_services']:
+                                print(f"  - {service['name']} on port {service['port']} (score: {service['risk_score']:.1f})")
+                        if assessment.get('recommendations'):
+                            print("Recommendations:")
+                            for rec in assessment['recommendations']:
+                                print(f"  - {rec}")
+                        print("\033[0m")  # Reset color
+            except Exception as e:
+                self.logger.error(f"Error in ML analysis for {target}: {str(e)}")
+                print(f"\033[91m[!] Error in ML analysis for {target}: {str(e)}\033[0m")
 
     def main_menu(self):
         """Main interactive menu"""
+        self.logger.info("Starting Interactive System Tester main menu")
         print("\033[94m=== Welcome to Interactive System Tester for Parrot OS ===\033[0m")
         print("Type 'exit' or press Ctrl+C to quit.\n")
         
         while True:
+            # Update completer with ML options
+            self.completer = WordCompleter([
+                'all', 'network', 'vulnerability', 'exploitation', 'anonymity', 'auditing', 'wireless',
+                'yes', 'no', 'verbose', 'quiet', '127.0.0.1', 'lan',
+                'configure', 'targets', 'run', 'export', 'exit', 'query_db', 'enhanced_report',
+                'configure_automation', 'create_profile', 'manage_profiles', 'show_recommendations',
+                'ml_predict', 'ml_risk_assessment', 'train_ml_model',
+                'text', 'html', 'enhanced_html', 'csv',
+                'post_exploit_deploy', 'post_exploit_command', 'post_exploit_evidence',
+                'post_exploit_exfiltrate', 'post_exploit_cleanup', 'post_exploit_report'
+            ], ignore_case=True)
+            
+            self.session = PromptSession(
+                style=self.style,
+                completer=self.completer,
+                key_bindings=self.bindings,
+                multiline=False,
+                prompt_message=HTML('<prompt>SystemTester> </prompt>')
+            )
+            
             choice = self.session.prompt(
-                HTML('<prompt>Choose an action (configure/targets/run/export/query_db/enhanced_report/configure_automation/exit): </prompt>')
+                HTML('<prompt>Choose an action (configure/targets/run/export/query_db/enhanced_report/create_profile/manage_profiles/show_recommendations/ml_predict/ml_risk_assessment/train_ml_model/configure_automation/exit/post_exploit_deploy/post_exploit_command/post_exploit_evidence/post_exploit_exfiltrate/post_exploit_cleanup/post_exploit_report): </prompt>')
             ).lower()
+            
+            self.logger.info(f"User selected menu option: {choice}")
 
             if choice == "exit":
                 if self.use_tor and self.check_tool("anonsurf"):
+                    self.logger.debug("Stopping AnonSurf before exit")
                     subprocess.run("anonsurf stop", shell=True, capture_output=True, text=True)
                 self.conn.close()
+                self.logger.info("Database connection closed, exiting application")
                 print("\033[92m[+] Exiting System Tester. Goodbye!\033[0m")
                 break
             elif choice == "configure":
+                self.logger.info("User is configuring system settings")
                 self.configure_settings()
             elif choice == "targets":
+                self.logger.info("User is selecting targets")
                 self.select_targets()
             elif choice == "run":
                 if not self.targets:
+                    self.logger.warning("Attempted to run scan without targets selected")
                     print("\033[93m[-] No targets selected. Please select targets first.\033[0m")
                     continue
+                self.logger.info(f"Starting tests with profile '{self.profile}' on {len(self.targets)} targets")
                 print(f"\n\033[94m[*] Starting tests with profile '{self.profile}' on {len(self.targets)} targets...\033[0m")
                 start_time = time.time()
                 self.run_profile()
                 end_time = time.time()
+                self.logger.info(f"Testing completed in {end_time - start_time:.2f} seconds")
                 print(f"\033[92m[+] Testing completed in {end_time - start_time:.2f} seconds\033[0m")
             elif choice == "export":
                 self.export_reports()
@@ -1716,18 +2478,185 @@ class InteractiveSystemTester:
                 self.query_db()
             elif choice == "enhanced_report":
                 self.generate_enhanced_report()
+            elif choice == "create_profile":
+                self.create_scan_profile()
+            elif choice == "manage_profiles":
+                self.manage_profiles()
+            elif choice == "show_recommendations":
+                self.show_recommendations()
             elif choice == "configure_automation":
                 self.configure_automation()
+            elif choice == "ml_predict":
+                if not self.targets:
+                    print("\033[93m[-] No targets selected. Please select targets first.\033[0m")
+                    continue
+                    
+                if not self.results:
+                    print("\033[93m[-] No scan results available. Please run a scan first.\033[0m")
+                    continue
+                    
+                if len(self.targets) > 1:
+                    target_choice = self.session.prompt(
+                        HTML('<prompt>Choose a target or "all" (default: all): </prompt>'),
+                        completer=WordCompleter(['all'] + self.targets, ignore_case=True)
+                    )
+                    if not target_choice or target_choice.lower() == 'all':
+                        self.analyze_with_ml_predictions()
+                    else:
+                        if target_choice in self.targets:
+                            self.analyze_with_ml_predictions(target_choice)
+                        else:
+                            print(f"\033[93m[-] Invalid target: {target_choice}\033[0m")
+                else:
+                    self.analyze_with_ml_predictions(self.targets[0])
+            elif choice == "ml_risk_assessment":
+                if not self.targets or not self.results:
+                    print("\033[93m[-] No targets or scan results available. Please run a scan first.\033[0m")
+                    continue
+                    
+                if not self.ml_risk_assessments:
+                    print("\033[94m[*] Generating ML-based risk assessment...\033[0m")
+                    try:
+                        self.ml_risk_assessments = get_risk_assessment_for_results(self.results)
+                    except Exception as e:
+                        print(f"\033[91m[!] Error generating risk assessment: {str(e)}\033[0m")
+                        continue
+                
+                # Display risk assessments
+                print("\n\033[94m=== ML-Based Risk Assessment ===\033[0m")
+                for target, assessment in self.ml_risk_assessments.items():
+                    if not isinstance(assessment, dict) or 'error' in assessment:
+                        print(f"\033[93m[-] No valid risk assessment for {target}\033[0m")
+                        continue
+                        
+                    # Choose color based on risk level
+                    risk_level = assessment.get('risk_level', 'Unknown')
+                    if risk_level == 'Critical':
+                        color = "\033[91m"  # Red
+                    elif risk_level == 'High':
+                        color = "\033[93m"  # Yellow
+                    elif risk_level == 'Medium':
+                        color = "\033[95m"  # Magenta
+                    else:
+                        color = "\033[92m"  # Green
+                        
+                    print(f"\n{color}Target: {target}")
+                    print(f"Risk Level: {risk_level} ({assessment.get('risk_score', 0):.1f}/100)")
+                    
+                    if assessment.get('high_risk_services'):
+                        print("High-risk services:")
+                        for service in assessment['high_risk_services']:
+                            print(f"  - {service['name']} on port {service['port']} (score: {service['risk_score']:.1f})")
+                    
+                    if assessment.get('recommendations'):
+                        print("Recommendations:")
+                        for rec in assessment['recommendations']:
+                            print(f"  - {rec}")
+                    print("\033[0m")  # Reset color
+            elif choice == "train_ml_model":
+                print("\n\033[94m=== Train ML Prediction Model ===\033[0m")
+                
+                if not self.use_ml_predictions or not self.ml_predictor:
+                    try:
+                        self.ml_predictor = MLVulnerabilityPredictor()
+                        self.use_ml_predictions = True
+                        print("\033[92m[+] ML Vulnerability Predictor initialized\033[0m")
+                    except Exception as e:
+                        print(f"\033[91m[!] Failed to initialize ML Vulnerability Predictor: {str(e)}\033[0m")
+                        continue
+                
+                confirm = self.session.prompt(
+                    HTML('<prompt>This will train/retrain the ML model. Continue? (yes/no): </prompt>'),
+                    completer=WordCompleter(['yes', 'no'], ignore_case=True)
+                ).lower()
+                
+                if confirm != "yes":
+                    print("\033[93m[-] Training cancelled\033[0m")
+                    continue
+                
+                print("\033[94m[*] Training ML model... This might take a while\033[0m")
+                try:
+                    success = self.ml_predictor.train_models(force=True)
+                    if success:
+                        print("\033[92m[+] ML model trained successfully\033[0m")
+                    else:
+                        print("\033[93m[-] ML model training completed with issues\033[0m")
+                except Exception as e:
+                    print(f"\033[91m[!] Error training ML model: {str(e)}\033[0m")
+            # Post-exploitation actions
+            elif choice == "post_exploit_deploy":
+                if not self.targets:
+                    print("\033[93m[-] No targets selected. Please select targets first.\033[0m")
+                    continue
+                target = self.session.prompt(
+                    HTML('<prompt>Enter target IP to deploy backdoor (or press Enter for first target): </prompt>')
+                ) or self.targets[0]
+                self.deploy_post_exploit_backdoor(target)
+            elif choice == "post_exploit_command":
+                session_id = self.session.prompt(
+                    HTML('<prompt>Enter session ID: </prompt>')
+                )
+                command = self.session.prompt(
+                    HTML('<prompt>Enter command to execute: </prompt>')
+                )
+                self.execute_post_exploit_command(session_id, command)
+            elif choice == "post_exploit_evidence":
+                session_id = self.session.prompt(
+                    HTML('<prompt>Enter session ID: </prompt>')
+                )
+                evidence_type = self.session.prompt(
+                    HTML('<prompt>Enter evidence type (system_info/network/users/processes): </prompt>'),
+                    completer=WordCompleter(['system_info', 'network', 'users', 'processes'], ignore_case=True)
+                ) or 'system_info'
+                self.gather_post_exploit_evidence(session_id, evidence_type)
+            elif choice == "post_exploit_exfiltrate":
+                session_id = self.session.prompt(
+                    HTML('<prompt>Enter session ID: </prompt>')
+                )
+                files = self.session.prompt(
+                    HTML('<prompt>Enter file paths to exfiltrate (comma-separated): </prompt>')
+                )
+                target_files = [f.strip() for f in files.split(',') if f.strip()]
+                self.exfiltrate_post_exploit_data(session_id, target_files)
+            elif choice == "post_exploit_cleanup":
+                session_id = self.session.prompt(
+                    HTML('<prompt>Enter session ID to clean up: </prompt>')
+                )
+                self.cleanup_post_exploit_session(session_id)
+            elif choice == "post_exploit_report":
+                self.generate_post_exploit_report()
             else:
-                print("\033[93m[-] Invalid choice. Options: configure, targets, run, export, query_db, enhanced_report, configure_automation, exit\033[0m")
+                print("\033[93m[-] Invalid choice. Options: configure, targets, run, export, query_db, enhanced_report, create_profile, manage_profiles, show_recommendations, ml_predict, ml_risk_assessment, train_ml_model, configure_automation, exit, post_exploit_deploy, post_exploit_command, post_exploit_evidence, post_exploit_exfiltrate, post_exploit_cleanup, post_exploit_report\033[0m")
 
 def main():
-    if os.geteuid() != 0:
-        print("\033[91m[!] This script requires root privileges. Please run with sudo.\033[0m")
+    try:
+        # Replace os.geteuid() with a cross-platform solution
+        logger.debug("Checking for admin/root privileges")
+        import platform
+        is_admin = False
+        if platform.system() == 'Windows':
+            import ctypes
+            is_admin = ctypes.windll.shell32.IsUserAnAdmin() != 0
+        else:
+            import os
+            is_admin = os.geteuid() == 0
+            
+        if not is_admin:
+            logger.warning("Script running without admin/root privileges")
+            print("\033[91m[!] This script requires admin/root privileges. Please run with elevated permissions.\033[0m")
+            sys.exit(1)
+    except Exception as e:
+        logger.error(f"Error checking admin status: {e}", exc_info=True)
+        print(f"\033[93m[!] Could not determine admin status: {e}. Proceeding anyway.\033[0m")
+        
+    try:
+        logger.info("Creating and starting Interactive System Tester")
+        tester = InteractiveSystemTester()
+        tester.main_menu()
+    except Exception as e:
+        logger.critical(f"Unhandled exception in main application: {e}", exc_info=True)
+        print(f"\033[91m[!] A critical error occurred: {e}\033[0m")
         sys.exit(1)
-
-    tester = InteractiveSystemTester()
-    tester.main_menu()
 
 if __name__ == "__main__":
     main()

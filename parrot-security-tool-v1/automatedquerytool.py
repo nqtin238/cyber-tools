@@ -477,9 +477,23 @@ class AutomatedQueryTool:
                 print("\033[93m[-] Invalid choice. Options: add_data, query_db, generate_report, configure_automation, exit\033[0m")
 
 def main():
-    if os.geteuid() != 0:
-        print("\033[91m[!] This script may require root privileges for some operations. Run with sudo if needed.\033[0m")
-        # sys.exit(1)  # Commented out to allow non-root execution for basic operations
+    try:
+        # Replace os.geteuid() with a cross-platform solution
+        import platform
+        is_admin = False
+        if platform.system() == 'Windows':
+            import ctypes
+            is_admin = ctypes.windll.shell32.IsUserAnAdmin() != 0
+        else:
+            import os
+            is_admin = os.geteuid() == 0
+            
+        if not is_admin:
+            print("\033[91m[!] This script may require admin/root privileges for some operations. Run with elevated permissions if needed.\033[0m")
+            # Continue execution for basic operations
+    except Exception as e:
+        print(f"\033[93m[!] Could not determine admin status: {e}. Proceeding anyway.\033[0m")
+        
     tool = AutomatedQueryTool()
     tool.main_menu()
 
