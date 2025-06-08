@@ -1,0 +1,12 @@
+[Unit]
+Description=circl dot lu CVE-Search db_updater trigger timer
+
+[Timer]
+Unit=cvesearch.db_updater.service
+OnActiveSec=0
+OnUnitActiveSec=3600
+OnUnitInactiveSec=3600
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target

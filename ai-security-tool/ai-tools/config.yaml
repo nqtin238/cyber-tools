@@ -1,0 +1,66 @@
+# LM Studio Configuration
+LMSTUDIO_API_URL: "http://localhost:1234/v1"
+LMSTUDIO_API_KEY: "lm-studio"
+LMSTUDIO_MODEL_NAME: "zysec-7b"
+
+# Security Analysis Configuration
+LMSTUDIO_TEMPERATURE: 0.7
+LMSTUDIO_MAX_TOKENS: 2000
+LMSTUDIO_TOP_P: 0.9
+
+# System Configuration
+SCAN_INTERVAL: 3600  # Default scan interval in seconds
+REPORT_DIR: "reports"
+LOG_LEVEL: "INFO"
+
+# IoT Device Configuration
+DEFAULT_SSH_PORT: 22
+DEFAULT_TIMEOUT: 30
+
+# Nmap Scanner Configuration
+NMAP:
+  TARGET_IP: "192.168.135.4"  # Default target IP
+  TIMING: 4  # Timing template (0-5)
+  PERFORMANCE:
+    MAX_PARALLEL_SCANS: 4
+    MAX_RETRIES: 2
+  SCAN_TYPES:
+    - name: "os_detection"
+      arguments: "-O"
+      enabled: true
+    - name: "tcp_scan"
+      arguments: "-sS -sV -p-"
+      enabled: true
+    - name: "udp_scan"
+      arguments: "-sU -sV --top-ports 1000"
+      enabled: true
+    - name: "service_enumeration"
+      arguments: "-sV --version-intensity 9"
+      enabled: true
+  OUTPUT_DIR: "results/raw/nmap"
+
+# Security Analysis Parameters
+SECURITY_CHECKS:
+  - name: "port_scan"
+    enabled: true
+    timeout: 30
+  - name: "vulnerability_scan"
+    enabled: true
+    timeout: 60
+  - name: "service_enumeration"
+    enabled: true
+    timeout: 45
+
+# Report Generation
+REPORT_FORMAT: "markdown"
+REPORT_SECTIONS:
+  - "executive_summary"
+  - "vulnerability_analysis"
+  - "security_recommendations"
+  - "remediation_steps"
+
+# Logging Configuration
+LOGGING:
+  level: "INFO"
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  file: "security_analysis.log"

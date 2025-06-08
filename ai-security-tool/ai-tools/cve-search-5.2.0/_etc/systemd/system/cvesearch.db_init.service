@@ -1,0 +1,13 @@
+[Unit]
+Description=circl dot lu CVE-Search database initialization (only run this once!)
+Requires=mongod.service redis-server.service
+After=network.target mongod.service redis-server.service
+RefuseManualStart=true
+Documentation=https://cve-search.github.io/cve-search/getting_started/installation.html
+
+[Service]
+WorkingDirectory=/opt/cve/cve-search
+ExecStart=python3 ./sbin/db_updater.py -f -c
+User=cve
+Type=oneshot
+SyslogIdentifier=cvesearch.db_updater
